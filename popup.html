@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>노래 길이 작업 실행기</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <h1>🎵 노래 길이 작업 실행기</h1>
+    
+    <div class="section">
+      <h2>1. 노래 검색</h2>
+      <div class="input-group">
+        <input type="text" id="songQuery" placeholder="노래 제목 또는 아티스트명 입력" />
+        <button id="searchBtn">검색</button>
+      </div>
+      <div id="apiKeyGroup" class="input-group" style="margin-top: 10px;">
+        <input type="password" id="apiKey" placeholder="YouTube API Key (선택사항)" />
+        <button id="saveApiKeyBtn">저장</button>
+      </div>
+    </div>
+
+    <div id="songResult" class="song-result" style="display: none;">
+      <div class="song-info">
+        <img id="songThumbnail" src="" alt="썸네일" />
+        <div class="song-details">
+          <h3 id="songTitle"></h3>
+          <p id="songChannel"></p>
+          <p class="duration" id="songDuration"></p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>2. 작업 설정</h2>
+      <div class="input-group">
+        <textarea id="taskDescription" placeholder="실행할 작업을 설명하세요 (선택사항)"></textarea>
+      </div>
+      <button id="startTaskBtn" class="btn-primary" disabled>작업 시작</button>
+    </div>
+
+    <div id="taskStatus" class="task-status" style="display: none;">
+      <h2>작업 진행 중</h2>
+      <div class="progress-container">
+        <div class="progress-bar">
+          <div id="progressFill" class="progress-fill"></div>
+        </div>
+        <div class="progress-info">
+          <span id="elapsedTime">0:00</span>
+          <span id="remainingTime">0:00</span>
+        </div>
+      </div>
+      <button id="stopTaskBtn" class="btn-secondary">중지</button>
+    </div>
+
+    <div class="section" id="soopSection">
+      <h2>🎧 Soop 기능</h2>
+      <div id="soopStatus" class="soop-status">
+        <p id="soopStatusText">Soop 페이지를 확인하는 중...</p>
+      </div>
+      <div class="input-group" style="margin-top: 10px;">
+        <button id="checkSoopBtn" class="btn-secondary">Soop 페이지 확인</button>
+        <button id="getSoopInfoBtn" class="btn-secondary" disabled>정보 가져오기</button>
+      </div>
+      <div id="soopInfo" class="soop-info" style="display: none;">
+        <h3>Soop 정보</h3>
+        <p id="soopInfoText"></p>
+      </div>
+    </div>
+
+    <div id="message" class="message"></div>
+  </div>
+
+  <script src="songSearch.js"></script>
+  <script src="taskRunner.js"></script>
+  <script src="soopHandler.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "노래 길이 작업 실행기",
+  "version": "1.0.0",
+  "description": "노래 검색 후 노래 길이 동안 특정 작업을 실행하는 확장 프로그램",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://www.youtube.com/*",
+    "https://play.sooplive.co.kr/*"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://play.sooplive.co.kr/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
