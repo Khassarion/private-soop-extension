@@ -17,7 +17,10 @@ const songTitle = document.getElementById('songTitle');
 const songChannel = document.getElementById('songChannel');
 const songDuration = document.getElementById('songDuration');
 const songThumbnail = document.getElementById('songThumbnail');
-const taskDescription = document.getElementById('taskDescription');
+const cheerEmoticonInput = document.getElementById('cheerEmoticon');
+const cheerCountInput = document.getElementById('cheerCount');
+const minDelayInput = document.getElementById('minDelay');
+const maxDelayInput = document.getElementById('maxDelay');
 const startTaskBtn = document.getElementById('startTaskBtn');
 const taskStatus = document.getElementById('taskStatus');
 const progressFill = document.getElementById('progressFill');
@@ -174,16 +177,35 @@ async function handleStartTask() {
   }
 
   const duration = currentSongInfo.durationInSeconds;
-  const taskDesc = taskDescription.value.trim();
+  const emoticon = cheerEmoticonInput.value.trim();
+  const count = Number(cheerCountInput.value);
+  const minDelay = Number(minDelayInput.value) * 1000;
+  const maxDelay = Number(maxDelayInput.value) * 1000;
 
-  // 여기에 실제 작업 함수를 추가할 수 있습니다
-  const taskFunction = async () => {
-    console.log('작업 시작:', taskDesc || '기본 작업');
-    // 실제 작업 로직을 여기에 구현
-    // 예: 탭 새로고침, 특정 웹사이트 방문, 알림 표시 등
-  };
+  if (!Number.isFinite(duration) || duration <= 0) {
+    showMessage('노래 길이를 확인할 수 없어 작업을 시작할 수 없습니다.', 'error');
+    return;
+  }
 
-  await taskRunner.start(duration, taskFunction);
+  if (!/^\/.+\/$/.test(emoticon) ||
+      !Number.isInteger(count) || count < 1 || count > 20 ||
+      !Number.isFinite(minDelay) || !Number.isFinite(maxDelay) ||
+      minDelay < 1000 || maxDelay < minDelay) {
+    showMessage('응원봉 개수와 전송 간격을 올바르게 입력해주세요.', 'error');
+    return;
+  }
+
+  try {
+    const response = await soopHandler.executeAction('startCheer', {
+      options: { emoticon, count, minDelay, maxDelay, duration }
+    });
+    if (!response?.success) {
+      throw new Error(response?.error || '응원봉 자동 전송을 시작할 수 없습니다.');
+    }
+    await taskRunner.start(duration);
+  } catch (error) {
+    showMessage(`작업 시작 실패: ${error.message}`, 'error');
+  }
 }
 
 // 작업 중지
@@ -191,6 +213,9 @@ function handleStopTask() {
   if (taskRunner.isRunning) {
     taskRunner.stop(false);
   }
+  soopHandler.executeAction('stopCheer').catch((error) => {
+    showMessage(`작업 중지 실패: ${error.message}`, 'error');
+  });
 }
 
 // 진행 상황 업데이트

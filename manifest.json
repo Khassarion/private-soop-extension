@@ -10,18 +10,16 @@
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://www.youtube.com/*",
-    "https://play.sooplive.co.kr/*"
+    "https://play.sooplive.com/*"
   ],
-  "action": {
-    "default_popup": "popup.html"
-  },
+  "action": {},
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "src/background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://play.sooplive.co.kr/*"],
-      "js": ["content.js"],
+      "matches": ["https://play.sooplive.com/*"],
+      "js": ["src/songSearch.js", "src/content.js"],
       "run_at": "document_idle"
     }
   ]

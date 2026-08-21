@@ -1,11 +1,11 @@
 /**
- * Soop (play.sooplive.co.kr) 핸들러 모듈
+ * Soop (play.sooplive.com) 핸들러 모듈
  * Soop 사이트에서 동작하는 기능을 처리합니다.
  */
 
 class SoopHandler {
   constructor() {
-    this.soopDomain = 'play.sooplive.co.kr';
+    this.soopDomain = 'play.sooplive.com';
     this.isActive = false;
   }
 
@@ -21,7 +21,7 @@ class SoopHandler {
       }
       
       const url = new URL(tab.url);
-      return url.hostname === this.soopDomain || url.hostname.includes('sooplive.co.kr');
+      return url.hostname === this.soopDomain;
     } catch (error) {
       console.error('Soop 탭 확인 오류:', error);
       return false;
@@ -98,6 +98,11 @@ class SoopHandler {
       switch (action) {
         case 'getCurrentInfo':
           return await this.getSoopInfo();
+
+        case 'startCheer':
+        case 'stopCheer':
+        case 'getCheerStatus':
+          return await this.sendMessageToSoop({ action, ...params });
         
         case 'customAction':
           // 커스텀 작업 구현
