@@ -1,11 +1,9 @@
 (() => {
-  const hideBroadcastButton = () => {
-    const broadcastButton = document.querySelector('button.btn-broadcast');
-    if (broadcastButton) broadcastButton.style.display = 'none';
-  };
+  const hideBroadcastButton = () => document
+    .querySelector('button.btn-broadcast')?.style.setProperty('display', 'none');
 
   hideBroadcastButton();
 
   const observer = new MutationObserver(hideBroadcastButton);
-  observer.observe(document.body, { childList: true, subtree: true });
+  observer.observe(document.documentElement, { childList: true, subtree: true });
 })();

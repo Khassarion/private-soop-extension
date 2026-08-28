@@ -304,14 +304,7 @@ function initializeControlPanel() {
   let songInfo = null;
   let statusTimer = null;
   let fadeTimer = null;
-  let isDragging = false;
-  let dragMoved = false;
-  let dragStartX = 0;
-  let dragStartY = 0;
-  let dragStartLeft = 0;
-  let dragStartTop = 0;
-  let pendingLeft = 0;
-  let pendingTop = 0;
+  let drag = null;
   let dragFrame = 0;
 
   const panelElement = panel('.panel');
@@ -335,83 +328,79 @@ function initializeControlPanel() {
     if (collapseButton.contains(event.target)) return;
 
     const bounds = host.getBoundingClientRect();
-    dragStartX = event.clientX;
-    dragStartY = event.clientY;
-    dragStartLeft = bounds.left;
-    dragStartTop = bounds.top;
-    pendingLeft = bounds.left;
-    pendingTop = bounds.top;
-    dragMoved = false;
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: bounds.left,
+      startTop: bounds.top,
+      left: bounds.left,
+      top: bounds.top
+    };
     host.style.left = `${bounds.left}px`;
     host.style.top = `${bounds.top}px`;
     host.style.right = 'auto';
     host.style.bottom = 'auto';
     host.style.transform = 'translate3d(0, 0, 0)';
-    isDragging = true;
     panelHeader.setPointerCapture(event.pointerId);
-    host.style.opacity = '1';
+    showPanel();
     event.preventDefault();
   });
 
   panelHeader.addEventListener('pointermove', (event) => {
-    if (!isDragging) return;
+    if (!drag) return;
 
-    const deltaX = event.clientX - dragStartX;
-    const deltaY = event.clientY - dragStartY;
-    if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) {
-      dragMoved = true;
-    }
+    const deltaX = event.clientX - drag.startX;
+    const deltaY = event.clientY - drag.startY;
     const maxLeft = Math.max(0, window.innerWidth - host.offsetWidth);
     const maxTop = Math.max(0, window.innerHeight - host.offsetHeight);
-    pendingLeft = Math.min(maxLeft, Math.max(0, dragStartLeft + deltaX));
-    pendingTop = Math.min(maxTop, Math.max(0, dragStartTop + deltaY));
+    drag.left = Math.min(maxLeft, Math.max(0, drag.startLeft + deltaX));
+    drag.top = Math.min(maxTop, Math.max(0, drag.startTop + deltaY));
 
     if (!dragFrame) {
       dragFrame = requestAnimationFrame(() => {
-        host.style.transform = `translate3d(${pendingLeft - dragStartLeft}px, ${pendingTop - dragStartTop}px, 0)`;
+        host.style.transform = `translate3d(${drag.left - drag.startLeft}px, ${drag.top - drag.startTop}px, 0)`;
         dragFrame = 0;
       });
     }
   });
 
   const finishDragging = (event) => {
-    if (!isDragging) return;
+    if (!drag) return;
     if (dragFrame) {
       cancelAnimationFrame(dragFrame);
       dragFrame = 0;
     }
-    host.style.left = `${pendingLeft}px`;
-    host.style.top = `${pendingTop}px`;
+    host.style.left = `${drag.left}px`;
+    host.style.top = `${drag.top}px`;
     host.style.transform = 'translate3d(0, 0, 0)';
-    isDragging = false;
     if (panelHeader.hasPointerCapture(event.pointerId)) {
       panelHeader.releasePointerCapture(event.pointerId);
     }
+    drag = null;
     resetFadeTimer();
   };
 
   panelHeader.addEventListener('pointerup', finishDragging);
   panelHeader.addEventListener('pointercancel', finishDragging);
-  host.addEventListener('pointermove', () => {
-    host.style.opacity = '1';
-    resetFadeTimer();
-  });
-  host.addEventListener('pointerenter', () => {
-    host.style.opacity = '1';
-    resetFadeTimer();
-  });
+  host.addEventListener('pointermove', showPanel);
+  host.addEventListener('pointerenter', showPanel);
   document.addEventListener('mousemove', () => {
     if (host.style.opacity !== '0') return;
-    host.style.opacity = '1';
-    resetFadeTimer();
+    showPanel();
   });
   resetFadeTimer();
+
+  function showPanel() {
+    host.style.opacity = '1';
+    resetFadeTimer();
+  }
 
   function resetFadeTimer() {
     clearTimeout(fadeTimer);
     if (!panelElement.classList.contains('collapsed')) return;
     fadeTimer = setTimeout(() => {
-      if (!isDragging) host.style.opacity = '0';
+      if (!drag) host.style.opacity = '0';
     }, 1000);
   }
 
