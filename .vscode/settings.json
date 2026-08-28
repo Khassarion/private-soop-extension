@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^node --check src/hideBroadcastButton\\.js; node --check src/content\\.js; Get-Content -Raw manifest\\.json \\| ConvertFrom-Json \\| Out-Null$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

@@ -237,7 +237,7 @@ function initializeControlPanel() {
 
   const host = document.createElement('div');
   host.id = 'private-extension-panel-host';
-  host.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 2147483647;';
+  host.style.cssText = 'position: fixed; top: 20px; right: 20px; z-index: 2147483647; will-change: transform;';
   document.documentElement.appendChild(host);
 
   const shadowRoot = host.attachShadow({ mode: 'open' });
@@ -246,7 +246,7 @@ function initializeControlPanel() {
       :host { all: initial; }
       * { box-sizing: border-box; }
       .panel { width: 360px; max-height: calc(100vh - 40px); overflow-y: auto; padding: 18px; color: #1f2937; background: #fff; border: 1px solid #d1d5db; border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.22); font: 14px/1.4 Arial, sans-serif; }
-      .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; cursor: move; user-select: none; }
+      .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; cursor: move; user-select: none; touch-action: none; }
       h1 { margin: 0; font-size: 18px; color: #374151; }
       .collapse-button { width: 28px; height: 28px; padding: 0; font-size: 18px; line-height: 1; }
       .panel.collapsed { width: 44px; height: 44px; min-height: 44px; padding: 7px; overflow: hidden; }
@@ -305,75 +305,113 @@ function initializeControlPanel() {
   let statusTimer = null;
   let fadeTimer = null;
   let isDragging = false;
-  let dragStartedOnCollapseButton = false;
   let dragMoved = false;
-  let suppressCollapseClick = false;
-  let dragOffsetX = 0;
-  let dragOffsetY = 0;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let dragStartLeft = 0;
+  let dragStartTop = 0;
+  let pendingLeft = 0;
+  let pendingTop = 0;
+  let dragFrame = 0;
 
   const panelElement = panel('.panel');
   const panelHeader = panel('.panel-header');
   const collapseButton = panel('#collapse');
 
   collapseButton.addEventListener('click', () => {
-    if (suppressCollapseClick) {
-      suppressCollapseClick = false;
-      return;
-    }
     panelElement.classList.toggle('collapsed');
     const isCollapsed = panelElement.classList.contains('collapsed');
     collapseButton.textContent = isCollapsed ? '+' : '−';
     collapseButton.title = isCollapsed ? '패널 펼치기' : '패널 접기';
     if (!isCollapsed) {
-      if (fadeTimer) clearTimeout(fadeTimer);
       host.style.opacity = '1';
+      clearTimeout(fadeTimer);
     } else {
       resetFadeTimer();
     }
   });
 
-  panelHeader.addEventListener('mousedown', (event) => {
+  panelHeader.addEventListener('pointerdown', (event) => {
+    if (collapseButton.contains(event.target)) return;
+
     const bounds = host.getBoundingClientRect();
-    dragOffsetX = event.clientX - bounds.left;
-    dragOffsetY = event.clientY - bounds.top;
-    dragStartedOnCollapseButton = event.target === collapseButton;
+    dragStartX = event.clientX;
+    dragStartY = event.clientY;
+    dragStartLeft = bounds.left;
+    dragStartTop = bounds.top;
+    pendingLeft = bounds.left;
+    pendingTop = bounds.top;
     dragMoved = false;
     host.style.left = `${bounds.left}px`;
     host.style.top = `${bounds.top}px`;
     host.style.right = 'auto';
     host.style.bottom = 'auto';
+    host.style.transform = 'translate3d(0, 0, 0)';
     isDragging = true;
+    panelHeader.setPointerCapture(event.pointerId);
+    host.style.opacity = '1';
     event.preventDefault();
   });
 
-  document.addEventListener('mousemove', (event) => {
-    host.style.opacity = '1';
-    resetFadeTimer();
-
+  panelHeader.addEventListener('pointermove', (event) => {
     if (!isDragging) return;
-    if (Math.abs(event.clientX - (dragOffsetX + host.getBoundingClientRect().left)) > 3 ||
-        Math.abs(event.clientY - (dragOffsetY + host.getBoundingClientRect().top)) > 3) {
+
+    const deltaX = event.clientX - dragStartX;
+    const deltaY = event.clientY - dragStartY;
+    if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) {
       dragMoved = true;
     }
     const maxLeft = Math.max(0, window.innerWidth - host.offsetWidth);
     const maxTop = Math.max(0, window.innerHeight - host.offsetHeight);
-    const left = Math.min(maxLeft, Math.max(0, event.clientX - dragOffsetX));
-    const top = Math.min(maxTop, Math.max(0, event.clientY - dragOffsetY));
-    host.style.left = `${left}px`;
-    host.style.top = `${top}px`;
+    pendingLeft = Math.min(maxLeft, Math.max(0, dragStartLeft + deltaX));
+    pendingTop = Math.min(maxTop, Math.max(0, dragStartTop + deltaY));
+
+    if (!dragFrame) {
+      dragFrame = requestAnimationFrame(() => {
+        host.style.transform = `translate3d(${pendingLeft - dragStartLeft}px, ${pendingTop - dragStartTop}px, 0)`;
+        dragFrame = 0;
+      });
+    }
   });
 
-  document.addEventListener('mouseup', () => {
-    if (dragStartedOnCollapseButton && dragMoved) suppressCollapseClick = true;
+  const finishDragging = (event) => {
+    if (!isDragging) return;
+    if (dragFrame) {
+      cancelAnimationFrame(dragFrame);
+      dragFrame = 0;
+    }
+    host.style.left = `${pendingLeft}px`;
+    host.style.top = `${pendingTop}px`;
+    host.style.transform = 'translate3d(0, 0, 0)';
     isDragging = false;
-    dragStartedOnCollapseButton = false;
+    if (panelHeader.hasPointerCapture(event.pointerId)) {
+      panelHeader.releasePointerCapture(event.pointerId);
+    }
+    resetFadeTimer();
+  };
+
+  panelHeader.addEventListener('pointerup', finishDragging);
+  panelHeader.addEventListener('pointercancel', finishDragging);
+  host.addEventListener('pointermove', () => {
+    host.style.opacity = '1';
+    resetFadeTimer();
+  });
+  host.addEventListener('pointerenter', () => {
+    host.style.opacity = '1';
+    resetFadeTimer();
+  });
+  document.addEventListener('mousemove', () => {
+    if (host.style.opacity !== '0') return;
+    host.style.opacity = '1';
+    resetFadeTimer();
   });
   resetFadeTimer();
 
   function resetFadeTimer() {
-    if (fadeTimer) clearTimeout(fadeTimer);
+    clearTimeout(fadeTimer);
+    if (!panelElement.classList.contains('collapsed')) return;
     fadeTimer = setTimeout(() => {
-       if (!isDragging && panelElement.classList.contains('collapsed')) host.style.opacity = '0';
+      if (!isDragging) host.style.opacity = '0';
     }, 1000);
   }
 
