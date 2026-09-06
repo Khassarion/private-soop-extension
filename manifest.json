@@ -21,7 +21,7 @@
   "content_scripts": [
     {
       "matches": ["https://play.sooplive.com/*"],
-      "js": ["src/songSearch.js", "src/content.js"],
+      "js": ["src/songSearch.js", "src/content.js", "src/disableAutoPlay.js"],
       "run_at": "document_idle"
     },
     {
