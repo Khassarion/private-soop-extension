@@ -7,6 +7,7 @@
     if (!autoPlayButton || clickedButtons.has(autoPlayButton)) return;
 
     clickedButtons.add(autoPlayButton);
+    console.log('Disabling auto-play...');
     autoPlayButton.click();
   };
 
