@@ -11,8 +11,11 @@
     autoPlayButton.click();
   };
 
-  disableAutoPlay();
+  chrome.storage.local.get(['settings']).then(({ settings }) => {
+    if (settings?.features?.disableAutoPlay?.enabled === false) return;
 
-  const observer = new MutationObserver(disableAutoPlay);
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+    disableAutoPlay();
+    const observer = new MutationObserver(disableAutoPlay);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  });
 })();

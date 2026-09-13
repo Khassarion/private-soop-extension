@@ -229,7 +229,23 @@ if (document.readyState === 'loading') {
 
 function initializeSoop() {
   console.log('Soop Content Script 초기화됨');
-  initializeControlPanel();
+  chrome.storage.local.get(['settings']).then(({ settings }) => {
+    if (settings?.features?.cheerAutoSend?.enabled === false) return;
+    initializeControlPanel();
+  });
+}
+
+async function getCheerAutoSendSettings() {
+  const { settings } = await chrome.storage.local.get(['settings']);
+  return settings?.features?.cheerAutoSend || {};
+}
+
+async function saveCheerAutoSendSettings(partial) {
+  const { settings } = await chrome.storage.local.get(['settings']);
+  const current = settings || { features: {} };
+  current.features = current.features || {};
+  current.features.cheerAutoSend = { ...(current.features.cheerAutoSend || {}), ...partial };
+  await chrome.storage.local.set({ settings: current });
 }
 
 function initializeControlPanel() {
@@ -404,19 +420,22 @@ function initializeControlPanel() {
     }, 1000);
   }
 
-  chrome.storage.local.get(['youtubeApiKey', 'cheerEmoticon']).then((data) => {
-    if (data.youtubeApiKey) apiKeyInput.value = data.youtubeApiKey;
-    if (data.cheerEmoticon) panel('#emoticon').value = data.cheerEmoticon;
+  getCheerAutoSendSettings().then((cheerSettings) => {
+    if (cheerSettings.youtubeApiKey) apiKeyInput.value = cheerSettings.youtubeApiKey;
+    if (cheerSettings.emoticon) panel('#emoticon').value = cheerSettings.emoticon;
+    if (cheerSettings.count) panel('#count').value = cheerSettings.count;
+    if (cheerSettings.minDelay) panel('#min-delay').value = cheerSettings.minDelay / 1000;
+    if (cheerSettings.maxDelay) panel('#max-delay').value = cheerSettings.maxDelay / 1000;
   });
 
   panel('#emoticon').addEventListener('change', (event) => {
-    chrome.storage.local.set({ cheerEmoticon: event.target.value.trim() });
+    saveCheerAutoSendSettings({ emoticon: event.target.value.trim() });
   });
 
   panel('#save-key').addEventListener('click', async () => {
     const apiKey = apiKeyInput.value.trim();
     if (!apiKey) return showPanelMessage('API Key를 입력해주세요.', true);
-    await chrome.storage.local.set({ youtubeApiKey: apiKey });
+    await saveCheerAutoSendSettings({ youtubeApiKey: apiKey });
     showPanelMessage('API Key가 저장되었습니다.');
   });
 
@@ -452,7 +471,12 @@ function initializeControlPanel() {
       duration: songInfo.durationInSeconds
     };
     try {
-      await chrome.storage.local.set({ cheerEmoticon: options.emoticon });
+      await saveCheerAutoSendSettings({
+        emoticon: options.emoticon,
+        count: options.count,
+        minDelay: options.minDelay,
+        maxDelay: options.maxDelay,
+      });
       const result = await startCheer(options);
       startButton.disabled = true;
       status.style.display = 'block';

@@ -5,6 +5,7 @@
   "description": "노래 검색 후 노래 길이 동안 특정 작업을 실행하는 확장 프로그램",
   "permissions": [
     "storage",
+    "alarms",
     "activeTab"
   ],
   "host_permissions": [
@@ -12,16 +13,22 @@
     "https://www.youtube.com/*",
     "https://www.sooplive.com/*",
     "https://play.sooplive.com/*",
-    "https://vod.sooplive.com/*"
+    "https://vod.sooplive.com/*",
+    "https://api-channel.sooplive.com/*"
   ],
   "action": {},
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  },
   "background": {
-    "service_worker": "src/background.js"
+    "service_worker": "src/background.js",
+    "type": "module"
   },
   "content_scripts": [
     {
       "matches": ["https://play.sooplive.com/*"],
-      "js": ["src/songSearch.js", "src/content.js", "src/disableAutoPlay.js"],
+      "js": ["src/songSearch.js", "src/content.js", "src/disableAutoPlay.js", "src/liveMonitor.js"],
       "run_at": "document_idle"
     },
     {
