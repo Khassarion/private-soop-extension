@@ -60,10 +60,18 @@
     lastCurrentTime = video.currentTime;
     lastProgressAt = Date.now();
 
+    muteVideo(video);
+
     video.addEventListener('ended', () => handlePlaybackStopped(streamerId, autoCloseDelaySeconds));
     video.addEventListener('error', () => handlePlaybackStopped(streamerId, autoCloseDelaySeconds));
 
     watchForPlaybackStart(video);
+  }
+
+  function muteVideo(video) {
+    if (video.muted) return;
+    video.muted = true;
+    console.log(`${LOG_TAG} 자동으로 연 라이브 탭 - 영상 음소거`);
   }
 
   /**
@@ -81,6 +89,7 @@
       if (video.currentTime > baseline) {
         playbackConfirmed = true;
         console.log(`${LOG_TAG} 영상 재생 시작 확인됨`);
+        muteVideo(video);
         chrome.runtime.sendMessage({ action: 'liveMonitor:playbackStarted' }).catch(() => {});
         return;
       }
