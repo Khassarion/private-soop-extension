@@ -1,7 +1,7 @@
 # Chrome Web Store Listing
 
 ## Extension name
-노래 길이 작업 실행기
+나만의 SOOP 확프
 
 ## Short description
 Soop 방송에서 노래 길이에 맞춰 응원봉을 자동 전송하고, 방송 종료 후 자동 재생을 제어하는 확장 프로그램입니다.

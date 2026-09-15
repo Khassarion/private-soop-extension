@@ -183,7 +183,7 @@ async function syncLiveCheckAlarm() {
 
 // 확장 프로그램 설치 시
 chrome.runtime.onInstalled.addListener(async () => {
-  console.log('노래 길이 작업 실행기 확장 프로그램이 설치되었습니다.');
+  console.log('나만의 SOOP 확프 확장 프로그램이 설치되었습니다.');
   await migrateLegacySettingsIfNeeded();
   await syncLiveCheckAlarm();
   runLiveCheck();

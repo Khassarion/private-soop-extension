@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "노래 길이 작업 실행기",
+  "name": "나만의 SOOP 확프",
   "version": "1.0.0.2",
-  "description": "노래 검색 후 노래 길이 동안 특정 작업을 실행하는 확장 프로그램",
+  "description": "Soop 생방송에서 응원봉 자동 전송, 자동 재생 끄기, 방송하기 버튼 숨기기, 라이브 자동 감시·오픈 기능을 제공하는 확장 프로그램",
   "permissions": [
     "storage",
     "alarms",
