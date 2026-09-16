@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "나만의 SOOP 확프",
   "version": "1.0.0.2",
-  "description": "Soop 생방송에서 응원봉 자동 전송, 자동 재생 끄기, 방송하기 버튼 숨기기, 라이브 자동 감시·오픈 기능을 제공하는 확장 프로그램",
+  "description": "Soop 생방송에서 응원봉 자동 전송, 자동 재생 끄기, 방송하기 버튼 숨기기, 라이브 자동 감시·오픈, 오늘의 포인트 현황 기능을 제공하는 확장 프로그램",
   "permissions": [
     "storage",
     "alarms",
@@ -14,7 +14,9 @@
     "https://www.sooplive.com/*",
     "https://play.sooplive.com/*",
     "https://vod.sooplive.com/*",
-    "https://api-channel.sooplive.com/*"
+    "https://api-channel.sooplive.com/*",
+    "https://afevent2.sooplive.com/*",
+    "https://tkapi.sooplive.com/*"
   ],
   "action": {},
   "options_ui": {
@@ -38,6 +40,15 @@
         "https://vod.sooplive.com/*"
       ],
       "js": ["src/hideBroadcastButton.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.sooplive.com/*",
+        "https://play.sooplive.com/*",
+        "https://vod.sooplive.com/*"
+      ],
+      "js": ["src/pointStatus.js"],
       "run_at": "document_idle"
     }
   ]

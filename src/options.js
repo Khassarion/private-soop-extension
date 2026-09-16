@@ -24,6 +24,9 @@ const DEFAULT_SETTINGS = {
       pollIntervalMinutes: 1,
       autoCloseDelaySeconds: 5,
     },
+    pointStatus: {
+      enabled: true,
+    },
   },
 };
 
@@ -49,6 +52,8 @@ const el = {
   addStreamerBtn: document.getElementById('addStreamerBtn'),
   streamerList: document.getElementById('streamerList'),
   streamerEmptyHint: document.getElementById('streamerEmptyHint'),
+
+  pointStatusEnabled: document.getElementById('pointStatusEnabled'),
 
   toast: document.getElementById('toast'),
 };
@@ -92,6 +97,8 @@ function renderAll() {
   el.autoCloseDelaySeconds.value = autoLiveOpen.autoCloseDelaySeconds;
   updateCardBodyState(el.autoLiveOpenBody, autoLiveOpen.enabled);
   renderStreamerList();
+
+  el.pointStatusEnabled.checked = settings.features.pointStatus.enabled;
 }
 
 function updateCardBodyState(bodyEl, enabled) {
@@ -210,6 +217,11 @@ function setupEventListeners() {
   el.addStreamerBtn.addEventListener('click', handleAddStreamer);
   el.newStreamerId.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') handleAddStreamer();
+  });
+
+  el.pointStatusEnabled.addEventListener('change', (e) => {
+    settings.features.pointStatus.enabled = e.target.checked;
+    persistSettings();
   });
 }
 

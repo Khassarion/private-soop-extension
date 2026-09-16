@@ -3,7 +3,7 @@
  * 확장 프로그램의 백그라운드 작업을 처리합니다.
  */
 
-import { isStreamerLive } from './soopLiveApi.js';
+import { isStreamerLive, getLoginId, getMissionStatus } from './soopLiveApi.js';
 
 const LOG_TAG = '[LiveMonitor]';
 const LIVE_CHECK_ALARM_NAME = 'liveCheck';
@@ -38,8 +38,19 @@ const DEFAULT_SETTINGS = {
       pollIntervalMinutes: 1,
       autoCloseDelaySeconds: 5,
     },
+    pointStatus: {
+      enabled: true,
+    },
   },
 };
+
+function todayDateString() {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
 
 /**
  * 저장된 설정과 기본값을 얕은 병합(기능 단위)하여 반환합니다.
@@ -282,6 +293,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
       }
       sendResponse({ success: true });
+    })();
+    return true;
+  }
+
+  if (request.action === 'pointStatus:fetch') {
+    (async () => {
+      try {
+        const loginId = await getLoginId();
+        if (!loginId) {
+          sendResponse({
+            success: false,
+            error: '로그인 정보를 확인할 수 없습니다. Soop에 로그인되어 있는지 확인해주세요.',
+          });
+          return;
+        }
+
+        const data = await getMissionStatus(loginId, todayDateString());
+        if (!data) {
+          sendResponse({ success: false, error: '포인트 정보를 가져오지 못했습니다.' });
+          return;
+        }
+
+        sendResponse({ success: true, data });
+      } catch (error) {
+        console.error('[pointStatus] 조회 오류:', error);
+        sendResponse({ success: false, error: '포인트 정보를 가져오는 중 오류가 발생했습니다.' });
+      }
     })();
     return true;
   }
