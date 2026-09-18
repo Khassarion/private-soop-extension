@@ -37,17 +37,24 @@
         .body { margin-top: 12px; }
         .category { margin-bottom: 12px; }
         .category:last-child { margin-bottom: 0; }
-        .category-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+        .category-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; cursor: pointer; user-select: none; }
+        .category-title { display: flex; align-items: center; gap: 5px; }
+        .category-toggle { font-size: 9px; color: #9ca3af; transition: transform .15s; }
+        .category.collapsed .category-toggle { transform: rotate(-90deg); }
         .category-name { font-weight: 700; font-size: 13px; color: #333; }
         .category-score { font-size: 12px; color: #6b7280; }
         .category-score.complete { color: #16a34a; }
         .category-bar { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-bottom: 6px; }
         .category-bar-fill { height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); }
+        .category.collapsed .category-bar,
+        .category.collapsed .detail-list { display: none; }
         .detail-list { list-style: none; display: flex; flex-direction: column; gap: 3px; }
-        .detail-item { display: flex; justify-content: space-between; padding: 3px 6px; border-radius: 4px; font-size: 12px; }
+        .detail-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 6px; border-radius: 4px; font-size: 12px; white-space: nowrap; }
         .detail-item.incomplete { background: #fef3f2; color: #b91c1c; }
         .detail-item.complete { color: #9ca3af; }
         .detail-item.complete .detail-name::before { content: '✓ '; }
+        .detail-name { overflow: hidden; text-overflow: ellipsis; }
+        .detail-meta { flex-shrink: 0; font-size: 11px; }
         .message { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0; }
         .message.error { color: #dc2626; }
       </style>
@@ -106,8 +113,8 @@
   }
 
   function renderCategories(contentEl, summaryBadge, data) {
-    const categories = Object.values(data || {});
-    if (categories.length === 0) {
+    const entries = Object.entries(data || {});
+    if (entries.length === 0) {
       contentEl.innerHTML = '<p class="message">표시할 포인트 정보가 없습니다.</p>';
       return;
     }
@@ -116,18 +123,19 @@
     let totalMaxPoint = 0;
 
     contentEl.innerHTML = '';
-    categories.forEach((category) => {
+    entries.forEach(([key, category]) => {
       totalPoint += category.POINT || 0;
       totalMaxPoint += category.MAX_POINT || 0;
-      contentEl.appendChild(renderCategory(category));
+      contentEl.appendChild(renderCategory(key, category));
     });
 
     summaryBadge.textContent = `${totalPoint}/${totalMaxPoint}`;
   }
 
-  function renderCategory(category) {
+  function renderCategory(key, category) {
     const isComplete = category.POINT >= category.MAX_POINT;
     const percent = category.MAX_POINT > 0 ? Math.min(100, (category.POINT / category.MAX_POINT) * 100) : 100;
+    const defaultCollapsed = key === 'ETC';
 
     const details = Object.values(category.DETAIL || {}).sort((a, b) => {
       const aComplete = a.COUNT >= a.MAX_COUNT ? 1 : 0;
@@ -136,10 +144,10 @@
     });
 
     const el = document.createElement('div');
-    el.className = 'category';
+    el.className = `category${defaultCollapsed ? ' collapsed' : ''}`;
     el.innerHTML = `
       <div class="category-header">
-        <span class="category-name"></span>
+        <span class="category-title"><span class="category-toggle">▾</span><span class="category-name"></span></span>
         <span class="category-score${isComplete ? ' complete' : ''}"></span>
       </div>
       <div class="category-bar"><div class="category-bar-fill" style="width:${percent}%"></div></div>
@@ -148,15 +156,24 @@
 
     el.querySelector('.category-name').textContent = category.NAME;
     el.querySelector('.category-score').textContent = `${category.POINT}/${category.MAX_POINT}`;
+    el.querySelector('.category-header').addEventListener('click', () => {
+      el.classList.toggle('collapsed');
+    });
 
     const list = el.querySelector('.detail-list');
     details.forEach((detail) => {
       const detailComplete = detail.COUNT >= detail.MAX_COUNT;
+      const perCountPoint = detail.MAX_COUNT > 0
+        ? Math.round((detail.MAX_POINT / detail.MAX_COUNT) * 10) / 10
+        : detail.MAX_POINT;
+
       const item = document.createElement('li');
       item.className = `detail-item ${detailComplete ? 'complete' : 'incomplete'}`;
-      item.innerHTML = '<span class="detail-name"></span><span class="detail-count"></span>';
+      item.innerHTML = '<span class="detail-name"></span><span class="detail-meta"></span>';
       item.querySelector('.detail-name').textContent = detail.NAME;
-      item.querySelector('.detail-count').textContent = `${detail.COUNT}/${detail.MAX_COUNT}`;
+      item.querySelector('.detail-meta').textContent =
+        `개당 ${perCountPoint}P · ${detail.COUNT}/${detail.MAX_COUNT}회`;
+
       list.appendChild(item);
     });
 
