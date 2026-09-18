@@ -250,8 +250,8 @@
 
     const dateLabel = formatKoreanDate(start);
     const label = totalCount > 1
-      ? `${dateLabel} 다시보기 (${index + 1}/${totalCount})`
-      : `${dateLabel} 다시보기`;
+      ? `${dateLabel} (${index + 1}/${totalCount})`
+      : dateLabel;
 
     const descriptionLines = [
       `VOD: ${vodUrl}`,
