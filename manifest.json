@@ -1,13 +1,19 @@
 {
   "manifest_version": 3,
   "name": "나만의 SOOP 확프",
-  "version": "1.0.0.2",
-  "description": "Soop 생방송에서 응원봉 자동 전송, 자동 재생 끄기, 방송하기 버튼 숨기기, 라이브 자동 감시·오픈, 오늘의 포인트 현황 기능을 제공하는 확장 프로그램",
+  "version": "1.1.0.0",
+  "description": "Soop 생방송에서 응원봉 자동 전송, 자동 재생 끄기, 방송하기 버튼 숨기기, 라이브 자동 감시·오픈, 오늘의 포인트 현황, VOD 파일별 상세 정보 기능을 제공하는 확장 프로그램",
   "permissions": [
     "storage",
     "alarms",
-    "activeTab"
+    "activeTab",
+    "identity",
+    "downloads"
   ],
+  "oauth2": {
+    "client_id": "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+    "scopes": ["https://www.googleapis.com/auth/youtube"]
+  },
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://www.youtube.com/*",
@@ -16,7 +22,8 @@
     "https://vod.sooplive.com/*",
     "https://api-channel.sooplive.com/*",
     "https://afevent2.sooplive.com/*",
-    "https://tkapi.sooplive.com/*"
+    "https://tkapi.sooplive.com/*",
+    "https://api.m.sooplive.com/*"
   ],
   "action": {},
   "options_ui": {
@@ -49,6 +56,11 @@
         "https://vod.sooplive.com/*"
       ],
       "js": ["src/pointStatus.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://vod.sooplive.com/*"],
+      "js": ["src/vodFileInfo.js"],
       "run_at": "document_idle"
     }
   ]

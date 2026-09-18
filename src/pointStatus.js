@@ -48,7 +48,7 @@
         .category-bar-fill { height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); }
         .category.collapsed .category-bar,
         .category.collapsed .detail-list { display: none; }
-        .detail-list { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+        .detail-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
         .detail-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 6px; border-radius: 4px; font-size: 12px; white-space: nowrap; }
         .detail-item.incomplete { background: #fef3f2; color: #b91c1c; }
         .detail-item.complete { color: #9ca3af; }

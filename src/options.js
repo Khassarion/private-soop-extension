@@ -27,6 +27,9 @@ const DEFAULT_SETTINGS = {
     pointStatus: {
       enabled: true,
     },
+    vodFileInfo: {
+      enabled: true,
+    },
   },
 };
 
@@ -54,6 +57,8 @@ const el = {
   streamerEmptyHint: document.getElementById('streamerEmptyHint'),
 
   pointStatusEnabled: document.getElementById('pointStatusEnabled'),
+
+  vodFileInfoEnabled: document.getElementById('vodFileInfoEnabled'),
 
   toast: document.getElementById('toast'),
 };
@@ -99,6 +104,8 @@ function renderAll() {
   renderStreamerList();
 
   el.pointStatusEnabled.checked = settings.features.pointStatus.enabled;
+
+  el.vodFileInfoEnabled.checked = settings.features.vodFileInfo.enabled;
 }
 
 function updateCardBodyState(bodyEl, enabled) {
@@ -221,6 +228,11 @@ function setupEventListeners() {
 
   el.pointStatusEnabled.addEventListener('change', (e) => {
     settings.features.pointStatus.enabled = e.target.checked;
+    persistSettings();
+  });
+
+  el.vodFileInfoEnabled.addEventListener('change', (e) => {
+    settings.features.vodFileInfo.enabled = e.target.checked;
     persistSettings();
   });
 }

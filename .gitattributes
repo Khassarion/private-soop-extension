@@ -1,0 +1,2 @@
+manifest.json filter=oauthredact
+scripts/git-filters/*.sh text eol=lf

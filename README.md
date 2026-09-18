@@ -10,7 +10,8 @@ Soop(숲) 생방송 페이지에 제어 패널을 삽입하고, 검색한 노래
 4. **라이브 자동 감시·오픈**: 등록한 스트리머가 방송을 시작하면 확인 없이 백그라운드 탭으로 자동으로 엽니다. 재생이 멈추면 라이브 상태를 재확인해 새로고침하거나, 방송 종료로 확인되면 카운트다운 후 탭을 자동으로 닫습니다(취소 가능).
 5. **페이지 패널**: 팝업을 닫아도 유지되는 시작·중지·진행 상태 UI를 Soop 페이지 우측에 표시합니다.
 6. **오늘의 포인트 현황**: Soop 페이지 한쪽 구석의 작은 패널로, mypoint 상세내역 페이지에 가지 않아도 오늘 어떤 활동의 포인트가 부족한지 카테고리·세부 항목별로 바로 확인할 수 있습니다.
-7. **설정 페이지**: 확장 프로그램 아이콘 클릭 시 열리는 설정 페이지에서 위 기능들을 개별적으로 켜고 끄고, 관련 값을 설정할 수 있습니다.
+7. **VOD 파일별 상세 정보 + 다운로드 + 유튜브 업로드**: VOD 재생 페이지에서 해당 VOD를 구성하는 파일별로 VOD URL·방송 당시 시작·종료 시각·채팅 로그 URL을 보여주고, 파일별로 바로 다운로드하거나, 이 정보로 제목/설명이 채워진 채 mp4 파일을 유튜브에 업로드할 수 있습니다(업로드는 최초 1회 OAuth 설정 필요).
+8. **설정 페이지**: 확장 프로그램 아이콘 클릭 시 열리는 설정 페이지에서 위 기능들을 개별적으로 켜고 끄고, 관련 값을 설정할 수 있습니다.
 
 ## 설치 방법
 
@@ -29,6 +30,7 @@ Soop(숲) 생방송 페이지에 제어 패널을 삽입하고, 검색한 노래
 3. **자동 재생 끄기 / 방송하기 버튼 숨기기**: 토글로 각각 켜고 끕니다.
 4. **라이브 자동 열기**: 기능을 켜고, 감시 주기(분)와 방송 종료 후 탭 자동 닫기까지의 시간(초)을 설정한 뒤, 감시할 스트리머 ID를 추가합니다. 등록된 스트리머는 개별적으로 켜고 끄거나 삭제할 수 있습니다.
 5. **오늘의 포인트 현황**: 토글로 켜고 끕니다. 별도 설정 없이 현재 Soop에 로그인된 계정 기준으로 자동 조회됩니다.
+6. **VOD 파일별 상세 정보**: 토글로 켜고 끕니다. 별도 설정 없이 VOD 재생 페이지에서 자동으로 조회됩니다.
 
 ### 응원봉 자동 전송 (Soop 페이지 패널)
 
@@ -49,17 +51,50 @@ Soop(숲) 생방송 페이지에 제어 패널을 삽입하고, 검색한 노래
 
 `www.sooplive.com`, `play.sooplive.com`, `vod.sooplive.com` 페이지 우측 하단에 작은 패널이 표시됩니다. 기본적으로 접힌 상태이며 클릭하면 펼쳐지면서 현재 로그인 계정의 오늘자 포인트 미션 현황(LIVE/VOD/방송국/기타 카테고리별 획득 포인트와 세부 활동별 달성 여부)을 불러옵니다. 아직 완료하지 않은 활동이 목록 위쪽에 강조되어 표시되며, 패널의 새로고침(⟳) 버튼으로 다시 조회할 수 있습니다.
 
+### VOD 파일별 상세 정보
+
+`vod.sooplive.com/player/{titleNo}` 형태의 VOD 재생 페이지 좌측 하단에 작은 패널이 표시됩니다. 해당 VOD의 각 파일마다 ①VOD 페이지 URL, ②방송 당시 실제 시작·종료 시각(예: `2026-09-16 20:15:32 ~ 2026-09-16 20:45:10`)과 길이, ③그 파일 구간의 채팅 로그 XML URL을 보여주며, 파일별 "복사" 버튼이나 "전체 복사" 버튼으로 이 세 가지가 정리된 텍스트를 클립보드에 복사할 수 있습니다. VOD를 파일 단위로 다운로드해 유튜브에 나눠 올릴 때, 각 영상 설명란에 붙여넣는 용도로 쓰기 위한 기능입니다.
+
+각 파일 항목의 "다운로드" 버튼을 누르면 Soop의 다운로드 인증 API로 실제 mp4 다운로드 주소를 받아와 크롬 다운로드 목록에 바로 내려받습니다(로그인 계정 기준, 파일별 화질은 Soop이 제공하는 것 중 첫 번째를 사용).
+
+각 파일 항목의 "유튜브에 업로드" 버튼을 누르면 제목(방송 날짜 다시보기)·설명(위 3가지 정보)이 미리 채워진 업로드 폼이 펼쳐집니다. 재생목록 항목은 계정의 재생목록 목록을 API로 불러와 드롭다운으로 보여주며(마지막으로 선택한 재생목록이 다음에도 자동으로 선택됨), "추가 안 함"을 고르면 재생목록에 넣지 않습니다. 위에서 받은(또는 이미 가지고 있는) mp4 파일을 선택하고 공개범위(기본 비공개)·재생목록을 확인한 뒤 "업로드 시작"을 누르면 유튜브에 바로 업로드되고(선택 시) 지정한 재생목록에도 추가되며, 진행률과 완료 후 영상 링크가 표시됩니다. 최초 사용 전 아래 "유튜브 업로드 연동 설정"을 먼저 진행해야 합니다.
+
+### 유튜브 업로드 연동 설정 (최초 1회)
+
+VOD 파일 목록 검색에 쓰는 "YouTube API Key"와 달리, 업로드(`videos.insert`)는 OAuth 2.0 사용자 인증이 필요합니다.
+
+1. API Key를 발급받은 것과 같은 Google Cloud 프로젝트에서 **YouTube Data API v3**가 활성화되어 있는지 확인합니다.
+2. `chrome://extensions`에서 개발자 모드를 켜고 이 확장 프로그램의 **ID**를 확인합니다.
+3. Google Cloud Console → `APIs & Services > Credentials > Create Credentials > OAuth client ID` → Application type을 **Chrome Extension**으로 선택하고 Application ID에 위 확장 프로그램 ID를 입력해 클라이언트를 만듭니다. 발급된 **Client ID**(`....apps.googleusercontent.com`)를 복사합니다.
+4. `OAuth consent screen`에서 Publishing status를 Testing으로 두고, 업로드에 사용할 본인 Google 계정을 **Test users**에 추가합니다 (업로드+재생목록 추가에 쓰는 `youtube` 스코프는 민감 스코프라 테스트 사용자 등록이 필요합니다).
+5. `manifest.json`의 `oauth2.client_id` 값(`YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com` 플레이스홀더)을 방금 발급받은 Client ID로 바꾸고 확장 프로그램을 새로고침합니다.
+6. 업로드 버튼을 처음 누르면 크롬이 Google 로그인/동의 팝업을 띄웁니다. 동의하면 이후에는 자동으로 인증됩니다.
+
+**주의**: 언팩(압축해제) 확장 프로그램의 ID는 설치 폴더 경로 기준으로 고정됩니다. 폴더를 옮기거나 이름을 바꾸면 ID가 바뀌어 OAuth 인증이 깨지므로, 이 경우 Google Cloud Console에서 OAuth 클라이언트의 Application ID를 새 ID로 업데이트해야 합니다.
+
+#### git에 실제 client_id가 올라가지 않도록 하기
+
+`manifest.json`에는 항상 실제 client_id가 들어있어야 확장 프로그램이 동작하지만, 이 값이 그대로 git 이력에 커밋되는 건 막고 싶을 수 있습니다. 이 저장소는 git의 clean 필터로 이를 처리합니다 — 작업 트리에는 실제 값을 그대로 두고 써도 되고, git에 커밋될 때만 자동으로 `YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com` 플레이스홀더로 치환됩니다(체크아웃 방향은 아무것도 건드리지 않습니다 — 새로 clone하거나 `git checkout manifest.json`을 하면 플레이스홀더가 그대로 나오니, 그럴 때마다 5번처럼 실제 값을 다시 입력해주면 됩니다). 새로 clone했거나 이 저장소를 처음 설정하는 경우, 아래 명령을 한 번만 실행하면 됩니다.
+
+```sh
+git config filter.oauthredact.clean "sh scripts/git-filters/clean-manifest.sh"
+git config filter.oauthredact.required true
+```
+
+이 설정은 저장소별 로컬 설정(`.git/config`)이라 clone할 때마다 다시 실행해야 합니다.
+
 ## 파일 구조
 
 - `manifest.json`: Chrome 확장 프로그램 설정
-- `src/background.js`: 백그라운드 서비스 워커 (설정 관리, 라이브 감시 알람, 탭 관리)
-- `src/soopLiveApi.js`: Soop API 호출 모듈 - 라이브 방송 상태, 로그인 정보, 포인트 미션 현황 조회 (background에서 사용)
+- `src/background.js`: 백그라운드 서비스 워커 (설정 관리, 라이브 감시 알람, 탭 관리, 파일 다운로드, 유튜브 업로드 - OAuth 토큰 발급 및 resumable upload)
+- `src/soopLiveApi.js`: Soop API 호출 모듈 - 라이브 방송 상태, 로그인 정보, 포인트 미션 현황, VOD 파일 정보 조회 (background에서 사용)
 - `src/content.js`: Soop 페이지 패널과 응원봉 자동 전송 로직
 - `src/songSearch.js`: YouTube 노래 검색 및 길이 조회 모듈
 - `src/disableAutoPlay.js`: 생방송 종료 후 자동 재생 끄기 로직
 - `src/hideBroadcastButton.js`: 방송하기 버튼 숨기기 로직
 - `src/liveMonitor.js`: 백그라운드가 자동으로 연 감시 탭에서 재생 상태를 감시하고 자동 새로고침·자동 닫기를 수행하는 content script
 - `src/pointStatus.js`: 오늘의 포인트 현황 패널을 표시하는 content script
+- `src/vodFileInfo.js`: VOD 재생 페이지에서 파일별 상세 정보 패널을 표시하는 content script
 - `src/options.html`, `src/options.js`, `src/options.css`: 확장 프로그램 설정 페이지
 - `src/popup.html`, `src/popup.js`, `src/styles.css`, `src/soopHandler.js`, `src/taskRunner.js`, `src/dummy.js`: 이전 팝업 기반 구현에서 사용하던 파일 (현재 manifest에 연결되어 있지 않음, 미사용)
 

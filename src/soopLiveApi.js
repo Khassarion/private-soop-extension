@@ -7,6 +7,8 @@
 const API_CHANNEL_ORIGIN = 'https://api-channel.sooplive.com';
 const AFEVENT2_ORIGIN = 'https://afevent2.sooplive.com';
 const TKAPI_ORIGIN = 'https://tkapi.sooplive.com';
+const API_M_ORIGIN = 'https://api.m.sooplive.com';
+const VOD_ORIGIN = 'https://vod.sooplive.com';
 
 /**
  * 스트리머 라이브 방송 정보 조회. 방송 중이 아니면 null.
@@ -109,4 +111,30 @@ export async function getMissionStatus(loginId, startDate) {
   const body = await res.json();
   if (!body || body.RESULT !== 1 || !body.DATA) return null;
   return body.DATA;
+}
+
+/**
+ * VOD 상세 정보 조회 (files 배열 - 각 file의 file_start/duration/chat 등 포함).
+ * @param {string|number} videoId titleNo (vod.sooplive.com/player/{titleNo})
+ * @returns {Promise<object|null>} data 객체 (files, write_tm, total_file_duration, bj_id 등), 실패 시 null
+ */
+export async function getSoopVodInfo(videoId) {
+  if (!videoId) return null;
+  const referer = `${VOD_ORIGIN}/player/${videoId}`;
+
+  const res = await fetch(`${API_M_ORIGIN}/station/video/a/view`, {
+    headers: {
+      accept: 'application/json, text/plain, */*',
+      'content-type': 'application/x-www-form-urlencoded',
+      Referer: referer,
+    },
+    body: `nTitleNo=${encodeURIComponent(videoId)}&nApiLevel=11&nPlaylistIdx=0`,
+    method: 'POST',
+    credentials: 'include',
+  });
+  if (res.status !== 200) return null;
+
+  const body = await res.json();
+  if (!body || body.result !== 1 || !body.data) return null;
+  return body.data;
 }
