@@ -29,6 +29,10 @@ const DEFAULT_SETTINGS = {
     },
     vodFileInfo: {
       enabled: true,
+      // YouTube Studio 업로드 창 자동 입력 옵션 (youtubeStudio.js가 사용)
+      youtubeVisibility: 'unlisted', // 'private' | 'unlisted' | 'public'
+      youtubeNotForKids: true,
+      youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
     },
   },
 };
@@ -59,6 +63,13 @@ const el = {
   pointStatusEnabled: document.getElementById('pointStatusEnabled'),
 
   vodFileInfoEnabled: document.getElementById('vodFileInfoEnabled'),
+  vodFileInfoBody: document.getElementById('vodFileInfoBody'),
+  youtubeVisibility: document.getElementById('youtubeVisibility'),
+  youtubeNotForKids: document.getElementById('youtubeNotForKids'),
+  newYoutubePlaylist: document.getElementById('newYoutubePlaylist'),
+  addYoutubePlaylistBtn: document.getElementById('addYoutubePlaylistBtn'),
+  youtubePlaylistList: document.getElementById('youtubePlaylistList'),
+  youtubePlaylistEmptyHint: document.getElementById('youtubePlaylistEmptyHint'),
 
   toast: document.getElementById('toast'),
 };
@@ -105,7 +116,12 @@ function renderAll() {
 
   el.pointStatusEnabled.checked = settings.features.pointStatus.enabled;
 
-  el.vodFileInfoEnabled.checked = settings.features.vodFileInfo.enabled;
+  const vodFileInfo = settings.features.vodFileInfo;
+  el.vodFileInfoEnabled.checked = vodFileInfo.enabled;
+  el.youtubeVisibility.value = vodFileInfo.youtubeVisibility;
+  el.youtubeNotForKids.checked = vodFileInfo.youtubeNotForKids;
+  updateCardBodyState(el.vodFileInfoBody, vodFileInfo.enabled);
+  renderYoutubePlaylists();
 }
 
 function updateCardBodyState(bodyEl, enabled) {
@@ -144,6 +160,47 @@ function renderStreamerList() {
 
     el.streamerList.appendChild(item);
   });
+}
+
+function renderYoutubePlaylists() {
+  const playlists = settings.features.vodFileInfo.youtubePlaylists;
+  el.youtubePlaylistList.innerHTML = '';
+  el.youtubePlaylistEmptyHint.style.display = playlists.length === 0 ? 'block' : 'none';
+
+  playlists.forEach((name, index) => {
+    const item = document.createElement('li');
+    item.className = 'streamer-item';
+    item.innerHTML = `
+      <span class="streamer-id"></span>
+      <button class="btn-danger streamer-remove">삭제</button>
+    `;
+    item.querySelector('.streamer-id').textContent = name;
+    item.querySelector('.streamer-remove').addEventListener('click', () => {
+      playlists.splice(index, 1);
+      persistSettings();
+      renderYoutubePlaylists();
+    });
+    el.youtubePlaylistList.appendChild(item);
+  });
+}
+
+function handleAddYoutubePlaylist() {
+  const name = el.newYoutubePlaylist.value.trim();
+  if (!name) {
+    showToast('재생목록 이름을 입력해주세요.', true);
+    return;
+  }
+
+  const playlists = settings.features.vodFileInfo.youtubePlaylists;
+  if (playlists.includes(name)) {
+    showToast('이미 등록된 재생목록입니다.', true);
+    return;
+  }
+
+  playlists.push(name);
+  el.newYoutubePlaylist.value = '';
+  persistSettings();
+  renderYoutubePlaylists();
 }
 
 function setupEventListeners() {
@@ -233,7 +290,23 @@ function setupEventListeners() {
 
   el.vodFileInfoEnabled.addEventListener('change', (e) => {
     settings.features.vodFileInfo.enabled = e.target.checked;
+    updateCardBodyState(el.vodFileInfoBody, e.target.checked);
     persistSettings();
+  });
+
+  el.youtubeVisibility.addEventListener('change', (e) => {
+    settings.features.vodFileInfo.youtubeVisibility = e.target.value;
+    persistSettings();
+  });
+
+  el.youtubeNotForKids.addEventListener('change', (e) => {
+    settings.features.vodFileInfo.youtubeNotForKids = e.target.checked;
+    persistSettings();
+  });
+
+  el.addYoutubePlaylistBtn.addEventListener('click', handleAddYoutubePlaylist);
+  el.newYoutubePlaylist.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') handleAddYoutubePlaylist();
   });
 }
 

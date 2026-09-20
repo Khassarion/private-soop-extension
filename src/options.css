@@ -85,7 +85,8 @@ h1 {
 
 input[type="text"],
 input[type="password"],
-input[type="number"] {
+input[type="number"],
+select {
   padding: 9px 10px;
   border: 1px solid #d8dbe2;
   border-radius: 6px;
@@ -94,6 +95,7 @@ input[type="number"] {
   width: 100%;
 }
 
+select:focus,
 input:focus {
   outline: none;
   border-color: #667eea;
@@ -248,4 +250,13 @@ button {
 .toast.visible {
   opacity: 1;
   transform: translate(-50%, 0);
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #333;
+  cursor: pointer;
 }

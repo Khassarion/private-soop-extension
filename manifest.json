@@ -7,13 +7,8 @@
     "storage",
     "alarms",
     "activeTab",
-    "identity",
     "downloads"
   ],
-  "oauth2": {
-    "client_id": "YOUR_OAUTH_CLIENT_ID.apps.googleusercontent.com",
-    "scopes": ["https://www.googleapis.com/auth/youtube"]
-  },
   "host_permissions": [
     "https://www.googleapis.com/*",
     "https://www.youtube.com/*",
@@ -61,6 +56,11 @@
     {
       "matches": ["https://vod.sooplive.com/*"],
       "js": ["src/vodFileInfo.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://studio.youtube.com/*"],
+      "js": ["src/youtubeStudio.js"],
       "run_at": "document_idle"
     }
   ]

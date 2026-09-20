@@ -43,6 +43,10 @@ const DEFAULT_SETTINGS = {
     },
     vodFileInfo: {
       enabled: true,
+      // YouTube Studio 업로드 창 자동 입력 옵션 (youtubeStudio.js가 사용)
+      youtubeVisibility: 'unlisted', // 'private' | 'unlisted' | 'public'
+      youtubeNotForKids: true,
+      youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
     },
   },
 };
@@ -53,24 +57,6 @@ function todayDateString() {
   const m = String(now.getMonth() + 1).padStart(2, '0');
   const d = String(now.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
-}
-
-/**
- * 유튜브 업로드용 OAuth 액세스 토큰을 가져옵니다. chrome.identity는 extension
- * 컨텍스트(background)에서만 접근 가능해 content script를 대신해 여기서 처리한다.
- * @param {boolean} interactive true면 필요 시 로그인/동의 팝업을 띄운다.
- * @returns {Promise<string>}
- */
-function getYoutubeAuthToken(interactive) {
-  return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive }, (token) => {
-      if (chrome.runtime.lastError || !token) {
-        reject(new Error(chrome.runtime.lastError?.message || '인증 토큰을 가져오지 못했습니다.'));
-        return;
-      }
-      resolve(token);
-    });
-  });
 }
 
 /**
@@ -120,6 +106,20 @@ async function getMonitoredTabs() {
 
 async function setMonitoredTabs(monitoredTabs) {
   await chrome.storage.session.set({ monitoredTabs });
+}
+
+// YouTube Studio 업로드 창을 열면서 미리 채워줄 제목/설명을 탭별로 보관한다.
+// (여러 파일의 업로드 탭을 연달아 열어도 서로 섞이지 않도록 tabId로 구분)
+const STUDIO_LOG_TAG = '[YoutubeStudio]';
+const YOUTUBE_UPLOAD_PAGE_URL = 'https://www.youtube.com/upload';
+
+async function getPendingStudioUploads() {
+  const { pendingStudioUploads } = await chrome.storage.session.get(['pendingStudioUploads']);
+  return pendingStudioUploads || {};
+}
+
+async function setPendingStudioUploads(pendingStudioUploads) {
+  await chrome.storage.session.set({ pendingStudioUploads });
 }
 
 /**
@@ -256,6 +256,15 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
+// 업로드 창으로 열었던 Studio 탭이 닫히면 보관 중이던 제목/설명도 정리합니다.
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const pending = await getPendingStudioUploads();
+  if (tabId in pending) {
+    delete pending[tabId];
+    await setPendingStudioUploads(pending);
+  }
+});
+
 // 메시지 리스너
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getStatus') {
@@ -362,27 +371,44 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  if (request.action === 'youtubePlaylists:fetch') {
+  if (request.action === 'youtubeStudio:open') {
     (async () => {
       try {
-        let token = await getYoutubeAuthToken(true);
-        let playlists;
-        try {
-          playlists = await listMyPlaylists(token);
-        } catch (error) {
-          if (error.status === 401) {
-            await new Promise((resolve) => chrome.identity.removeCachedAuthToken({ token }, resolve));
-            token = await getYoutubeAuthToken(true);
-            playlists = await listMyPlaylists(token);
-          } else {
-            throw error;
-          }
-        }
-        sendResponse({ success: true, playlists });
+        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
+        const pending = await getPendingStudioUploads();
+        pending[tab.id] = { title: request.title, description: request.description };
+        await setPendingStudioUploads(pending);
+        console.log(`${STUDIO_LOG_TAG} 업로드 탭 열림 (tabId=${tab.id}), 제목: ${request.title}`);
+        sendResponse({ success: true });
       } catch (error) {
-        console.error('[youtubeUpload] 재생목록 목록 조회 오류:', error);
+        console.error(`${STUDIO_LOG_TAG} 업로드 탭 열기 오류:`, error);
         sendResponse({ success: false, error: error.message });
       }
+    })();
+    return true;
+  }
+
+  if (request.action === 'youtubeStudio:init') {
+    (async () => {
+      const tabId = sender.tab?.id;
+      const pending = await getPendingStudioUploads();
+      const entry = tabId != null ? pending[tabId] : undefined;
+      if (!entry) {
+        sendResponse({ pending: false });
+        return;
+      }
+      const { vodFileInfo } = (await getSettings()).features;
+      console.log(`${STUDIO_LOG_TAG} Studio 탭에 제목/설명/옵션 전달 (tabId=${tabId})`);
+      sendResponse({
+        pending: true,
+        title: entry.title,
+        description: entry.description,
+        options: {
+          visibility: vodFileInfo.youtubeVisibility,
+          notForKids: vodFileInfo.youtubeNotForKids,
+          playlists: vodFileInfo.youtubePlaylists,
+        },
+      });
     })();
     return true;
   }
@@ -405,231 +431,3 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   return false;
 });
-
-/**
- * 유튜브 업로드 전용 포트.
- * 실제 네트워크 요청(토큰 발급 포함)은 여기 background에서만 수행한다 — content
- * script의 fetch/XHR은 host_permissions가 있어도 페이지 출처 기준 CORS 제약을
- * 그대로 받기 때문에(확장 컨텍스트만 CORS-free), googleapis.com 업로드는 반드시
- * background에서 처리해야 한다.
- *
- * File/Blob 객체 자체는 chrome.runtime 메시징으로 넘기지 않는다 — Blob은 구조화된
- * 복제 대상이 아니어서(넘기면 size/stream 등이 비어버려 "Content-Range" 파싱 오류가
- * 났었다) content script가 파일을 청크(ArrayBuffer, 8MiB)로 잘라 순서대로 보내고,
- * background는 청크 하나를 성공적으로 PUT할 때마다 'chunkAck'로 다음 청크를 요청하는
- * 방식으로 흐름을 제어한다.
- */
-const YOUTUBE_UPLOAD_ENDPOINT = 'https://www.googleapis.com/upload/youtube/v3/videos';
-
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'youtubeUpload') return;
-
-  const session = {
-    token: null,
-    sessionUrl: null,
-    totalSize: 0,
-    fileType: 'video/mp4',
-    playlistId: null,
-  };
-
-  port.onMessage.addListener((message) => {
-    if (message?.type === 'start') {
-      handleUploadStart(port, session, message).catch((error) => {
-        safePortPost(port, { type: 'error', message: error.message });
-      });
-    } else if (message?.type === 'chunk') {
-      handleUploadChunk(port, session, message).catch((error) => {
-        safePortPost(port, { type: 'error', message: error.message });
-      });
-    }
-  });
-});
-
-function safePortPost(port, message) {
-  try {
-    port.postMessage(message);
-  } catch (error) {
-    // 탭이 닫히는 등으로 포트가 이미 끊어진 경우 - 무시
-  }
-}
-
-async function handleUploadStart(port, session, { title, description, privacy, playlistId, fileName, fileType, fileSize }) {
-  const snippet = { title, description };
-  const status = { privacyStatus: privacy, selfDeclaredMadeForKids: false };
-
-  session.totalSize = fileSize;
-  session.fileType = fileType || 'video/mp4';
-  session.playlistId = playlistId || null;
-
-  session.token = await getYoutubeAuthToken(true);
-  try {
-    session.sessionUrl = await initiateResumableUpload(session.token, session.fileType, fileSize, snippet, status);
-  } catch (error) {
-    if (error.status === 401) {
-      await new Promise((resolve) => chrome.identity.removeCachedAuthToken({ token: session.token }, resolve));
-      session.token = await getYoutubeAuthToken(true);
-      session.sessionUrl = await initiateResumableUpload(session.token, session.fileType, fileSize, snippet, status);
-    } else {
-      throw error;
-    }
-  }
-
-  safePortPost(port, { type: 'ready' });
-}
-
-/**
- * base64 문자열을 바이트 배열로 되돌린다. chrome.runtime 메시징이 ArrayBuffer를
- * JSON으로 직렬화하면서 유실시키는 문제를 피하기 위해 content script가 base64로
- * 인코딩해서 보낸 청크를 여기서 원래 바이트로 복원한다.
- */
-function base64ToUint8Array(base64) {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-async function handleUploadChunk(port, session, { data, start, end, isLast }, retryCount = 0) {
-  let res;
-  try {
-    const bytes = base64ToUint8Array(data);
-    const headers = { 'Content-Type': session.fileType };
-    headers['Content-Range'] = `bytes ${start}-${end - 1}/${session.totalSize}`;
-    res = await fetch(session.sessionUrl, { method: 'PUT', headers, body: bytes });
-  } catch (networkError) {
-    if (retryCount < 1) {
-      return handleUploadChunk(port, session, { data, start, end, isLast }, retryCount + 1);
-    }
-    throw new Error('네트워크 오류로 업로드에 실패했습니다.');
-  }
-
-  if (isLast) {
-    if (!res.ok) {
-      const bodyText = await res.text().catch(() => '');
-      console.error('[youtubeUpload] 업로드 마지막 청크 실패:', res.status, bodyText);
-      throw new Error(`업로드 실패 (${res.status}): ${bodyText.slice(0, 300)}`);
-    }
-    const video = await res.json();
-
-    let playlistError = null;
-    if (session.playlistId) {
-      try {
-        await addVideoToPlaylist(session.token, session.playlistId, video.id);
-      } catch (error) {
-        playlistError = error.message;
-      }
-    }
-
-    safePortPost(port, { type: 'done', video, playlistError });
-    return;
-  }
-
-  if (res.status !== 308 && !res.ok) {
-    const bodyText = await res.text().catch(() => '');
-    console.error('[youtubeUpload] 업로드 청크 실패:', res.status, bodyText);
-    throw new Error(`업로드 실패 (${res.status}): ${bodyText.slice(0, 300)}`);
-  }
-
-  safePortPost(port, { type: 'progress', ratio: end / session.totalSize });
-  safePortPost(port, { type: 'chunkAck' });
-}
-
-/**
- * 업로드된 영상을 재생목록에 추가한다. 실패해도 업로드 자체는 이미 완료된 상태이므로
- * 호출부에서 별도로 처리(치명적 오류로 취급하지 않음).
- * @param {string} token
- * @param {string} playlistId
- * @param {string} videoId
- */
-async function addVideoToPlaylist(token, playlistId, videoId) {
-  const res = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json; charset=UTF-8',
-    },
-    body: JSON.stringify({
-      snippet: {
-        playlistId,
-        resourceId: { kind: 'youtube#video', videoId },
-      },
-    }),
-  });
-
-  if (!res.ok) {
-    const bodyText = await res.text().catch(() => '');
-    console.error('[youtubeUpload] 재생목록 추가 실패:', res.status, bodyText);
-    throw new Error(`재생목록 추가 실패 (${res.status}): ${bodyText.slice(0, 300)}`);
-  }
-}
-
-/**
- * 로그인한 계정의 재생목록 목록을 전부 가져온다 (페이지네이션 처리).
- * @param {string} token
- * @returns {Promise<{id: string, title: string}[]>}
- */
-async function listMyPlaylists(token) {
-  const playlists = [];
-  let pageToken = '';
-
-  do {
-    const url = new URL('https://www.googleapis.com/youtube/v3/playlists');
-    url.searchParams.set('part', 'snippet');
-    url.searchParams.set('mine', 'true');
-    url.searchParams.set('maxResults', '50');
-    if (pageToken) url.searchParams.set('pageToken', pageToken);
-
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-
-    if (!res.ok) {
-      const bodyText = await res.text().catch(() => '');
-      const error = new Error(`재생목록 목록 조회 실패 (${res.status}): ${bodyText.slice(0, 300)}`);
-      error.status = res.status;
-      throw error;
-    }
-
-    const data = await res.json();
-    for (const item of data.items || []) {
-      playlists.push({ id: item.id, title: item.snippet?.title || '(제목 없음)' });
-    }
-    pageToken = data.nextPageToken || '';
-  } while (pageToken);
-
-  return playlists;
-}
-
-/**
- * @param {string} token OAuth 액세스 토큰
- * @param {string} fileType
- * @param {number} fileSize
- * @param {object} snippet
- * @param {object} status
- * @returns {Promise<string>} 업로드 세션 URL
- */
-async function initiateResumableUpload(token, fileType, fileSize, snippet, status) {
-  const res = await fetch(`${YOUTUBE_UPLOAD_ENDPOINT}?uploadType=resumable&part=snippet,status`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json; charset=UTF-8',
-      'X-Upload-Content-Type': fileType || 'video/mp4',
-      'X-Upload-Content-Length': String(fileSize),
-    },
-    body: JSON.stringify({ snippet, status }),
-  });
-
-  if (!res.ok) {
-    const bodyText = await res.text().catch(() => '');
-    const error = new Error(`업로드 세션 생성 실패 (${res.status}): ${bodyText.slice(0, 300)}`);
-    error.status = res.status;
-    throw error;
-  }
-
-  const sessionUrl = res.headers.get('Location');
-  if (!sessionUrl) throw new Error('업로드 세션 URL을 받지 못했습니다.');
-  return sessionUrl;
-}

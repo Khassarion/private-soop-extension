@@ -8,36 +8,6 @@
 (() => {
   const HOST_ID = 'private-extension-vod-file-info-host';
 
-  // 유튜브 업로드는 이 탭(content script)이 파일을 청크로 잘라 background에 계속
-  // 보내줘야 끝까지 진행된다 — 탭을 닫으면 업로드가 중간에 그냥 멈추고 재생목록에도
-  // 추가되지 않는다. 진행 중에 실수로 탭을 닫지 않도록 경고창을 띄운다.
-  let activeYoutubeUploadCount = 0;
-  window.addEventListener('beforeunload', (event) => {
-    if (activeYoutubeUploadCount <= 0) return;
-    event.preventDefault();
-    event.returnValue = '';
-  });
-
-  // 계정의 재생목록 목록은 패널이 열려있는 동안 한 번만 조회해서 모든 업로드 폼이 공유한다.
-  let youtubePlaylistsPromise = null;
-  function getYoutubePlaylists() {
-    if (!youtubePlaylistsPromise) {
-      youtubePlaylistsPromise = fetchYoutubePlaylists().catch((error) => {
-        youtubePlaylistsPromise = null;
-        throw error;
-      });
-    }
-    return youtubePlaylistsPromise;
-  }
-
-  async function fetchYoutubePlaylists() {
-    const response = await chrome.runtime.sendMessage({ action: 'youtubePlaylists:fetch' });
-    if (!response?.success) {
-      throw new Error(response?.error || '재생목록을 불러오지 못했습니다.');
-    }
-    return response.playlists;
-  }
-
   chrome.storage.local.get(['settings']).then(({ settings }) => {
     if (settings?.features?.vodFileInfo?.enabled === false) return;
     if (!getVideoIdFromLocation()) return; // VOD 재생 페이지가 아니면 아무것도 하지 않음
@@ -82,28 +52,14 @@
         .file-link { font-size: 11px; color: #2563eb; text-decoration: none; }
         .file-link:hover { text-decoration: underline; }
         .file-actions { display: flex; gap: 6px; }
-        .copy-button, .upload-toggle-button, .download-button { flex: 1; padding: 5px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #2563eb; cursor: pointer; font-size: 11px; }
-        .copy-button:hover, .upload-toggle-button:hover, .download-button:hover:not(:disabled) { background: #eff6ff; }
+        .copy-button, .upload-button, .download-button { flex: 1; padding: 5px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #2563eb; cursor: pointer; font-size: 11px; }
+        .copy-button:hover, .upload-button:hover, .download-button:hover:not(:disabled) { background: #eff6ff; }
         .copy-button.copied { color: #16a34a; border-color: #86efac; }
-        .download-button:disabled { opacity: .5; cursor: not-allowed; }
-        .download-status { margin-top: 4px; font-size: 11px; color: #6b7280; }
-        .download-status.error { color: #dc2626; }
+        .download-button:disabled, .upload-button:disabled { opacity: .5; cursor: not-allowed; }
+        .file-status { margin-top: 4px; font-size: 11px; color: #6b7280; }
+        .file-status.error { color: #dc2626; }
         .copy-all-button { width: 100%; margin-bottom: 10px; padding: 7px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; font-size: 12px; font-weight: 600; }
         .copy-all-button:hover { background: #1d4ed8; }
-        .upload-form { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #cbd5e1; display: flex; flex-direction: column; gap: 6px; }
-        .upload-field { display: flex; flex-direction: column; gap: 2px; }
-        .upload-field label { font-size: 10px; color: #6b7280; }
-        .upload-field input[type="text"], .upload-field textarea, .upload-field select {
-          font: inherit; font-size: 11px; padding: 4px 6px; border: 1px solid #cbd5e1; border-radius: 4px; width: 100%; resize: vertical;
-        }
-        .upload-start-button { padding: 6px; border: 0; border-radius: 5px; background: #16a34a; color: #fff; cursor: pointer; font-size: 12px; font-weight: 600; }
-        .upload-start-button:hover:not(:disabled) { background: #15803d; }
-        .upload-start-button:disabled { opacity: .5; cursor: not-allowed; }
-        .upload-progress { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; display: none; }
-        .upload-progress-fill { height: 100%; width: 0%; background: #16a34a; transition: width .2s; }
-        .upload-status { font-size: 11px; color: #6b7280; }
-        .upload-status.error { color: #dc2626; }
-        .upload-status a { color: #2563eb; }
         .message { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0; }
         .message.error { color: #dc2626; }
       </style>
@@ -207,9 +163,9 @@
         <div class="file-actions">
           <button class="copy-button">정보 복사</button>
           <button class="download-button">다운로드</button>
-          <button class="upload-toggle-button">유튜브에 업로드</button>
+          <button class="upload-button">유튜브에 업로드</button>
         </div>
-        <div class="download-status"></div>
+        <div class="file-status"></div>
       `;
       item.querySelector('.file-name').textContent = meta.label;
       item.querySelector('.file-duration').textContent = meta.durationText;
@@ -317,21 +273,49 @@
   }
 
   /**
-   * 파일 항목에 "업로드" 토글 버튼과 인라인 업로드 폼을 붙인다.
-   * 실제 유튜브 업로드 네트워크 요청은 background(포트 'youtubeUpload')가 수행한다.
-   * (content script의 fetch/XHR은 host_permissions가 있어도 페이지 출처 기준 CORS
-   * 제약을 받아 googleapis.com 업로드에 그대로 쓸 수 없다 — extension 컨텍스트만 예외.)
+   * "유튜브에 업로드" 버튼: YouTube Studio 업로드 창을 새 탭으로 열면서, 이 파일의
+   * 제목/설명을 background에 맡겨둔다. Studio 탭에 붙는 youtubeStudio.js가 업로드 창에서
+   * 사용자가 mp4를 고르면 그 값을 제목/설명 칸에 자동으로 채워준다.
+   * (파일 자체는 브라우저가 로컬 경로 접근을 막고 확장 메시징으로 큰 바이너리를 옮길 수도
+   * 없어서, Studio의 "파일 선택"에서 사용자가 직접 고르는 단계가 남는다.)
    */
   function setupUploadUI(item, meta, getDownloadFileList) {
-    const toggleButton = item.querySelector('.upload-toggle-button');
-    let form = null;
+    const uploadButton = item.querySelector('.upload-button');
+    const statusEl = item.querySelector('.file-status');
 
-    toggleButton.addEventListener('click', () => {
-      if (!form) {
-        form = buildUploadForm(meta, getDownloadFileList);
-        item.appendChild(form);
+    uploadButton.addEventListener('click', async () => {
+      uploadButton.disabled = true;
+      statusEl.classList.remove('error');
+      statusEl.textContent = '업로드 창을 여는 중...';
+
+      try {
+        // 다운로드용 파일 목록에서 원본 방송 제목을 얻을 수 있으면 뒤에 붙이고,
+        // 못 얻으면(로그인 문제 등) 대괄호 부분만으로 진행한다.
+        let title = `[${meta.label}]`;
+        try {
+          const fileList = await getDownloadFileList();
+          const entry = fileList.find((f) => Number(f.file_order) === meta.index + 1);
+          const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
+          if (contentTitle) title = `${title} ${contentTitle}`;
+        } catch (_error) {
+          // 대괄호만 있는 제목 유지
+        }
+
+        const response = await chrome.runtime.sendMessage({
+          action: 'youtubeStudio:open',
+          title,
+          description: meta.descriptionText,
+        });
+        if (!response?.success) {
+          throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
+        }
+        statusEl.textContent = 'Studio 업로드 창을 열었습니다. mp4를 선택하면 제목/설명이 자동으로 입력됩니다.';
+      } catch (error) {
+        statusEl.textContent = `업로드 창 열기 실패: ${error.message}`;
+        statusEl.classList.add('error');
+      } finally {
+        uploadButton.disabled = false;
       }
-      form.style.display = form.style.display === 'none' ? 'flex' : 'none';
     });
   }
 
@@ -342,245 +326,6 @@
   function deriveContentTitle(fileName) {
     if (!fileName) return '';
     return fileName.replace(/\.[^./]+$/, '').replace(/_\d+$/, '');
-  }
-
-  function buildUploadForm(meta, getDownloadFileList) {
-    const form = document.createElement('div');
-    form.className = 'upload-form';
-    form.style.display = 'none';
-    form.innerHTML = `
-      <div class="upload-field">
-        <label>제목</label>
-        <input type="text" class="upload-title">
-      </div>
-      <div class="upload-field">
-        <label>설명</label>
-        <textarea class="upload-description" rows="3"></textarea>
-      </div>
-      <div class="upload-field">
-        <label>공개 범위</label>
-        <select class="upload-privacy">
-          <option value="private">비공개</option>
-          <option value="unlisted">미등록(링크 공유)</option>
-          <option value="public">공개</option>
-        </select>
-      </div>
-      <div class="upload-field">
-        <label>재생목록 (선택)</label>
-        <select class="upload-playlist">
-          <option value="">불러오는 중...</option>
-        </select>
-      </div>
-      <div class="upload-field">
-        <label>동영상 파일</label>
-        <input type="file" class="upload-file-input" accept="video/*">
-      </div>
-      <div class="upload-progress"><div class="upload-progress-fill"></div></div>
-      <div class="upload-status"></div>
-      <button class="upload-start-button" disabled>업로드 시작</button>
-    `;
-
-    const titleInput = form.querySelector('.upload-title');
-    const descriptionTextarea = form.querySelector('.upload-description');
-    const privacySelect = form.querySelector('.upload-privacy');
-    const playlistInput = form.querySelector('.upload-playlist');
-    const fileInput = form.querySelector('.upload-file-input');
-    const progressEl = form.querySelector('.upload-progress');
-    const progressFill = form.querySelector('.upload-progress-fill');
-    const statusEl = form.querySelector('.upload-status');
-    const startButton = form.querySelector('.upload-start-button');
-
-    titleInput.value = `[${meta.label}]`;
-    descriptionTextarea.value = meta.descriptionText;
-
-    getDownloadFileList()
-      .then((fileList) => {
-        const entry = fileList.find((f) => Number(f.file_order) === meta.index + 1);
-        const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
-        if (contentTitle) titleInput.value = `[${meta.label}] ${contentTitle}`;
-      })
-      .catch(() => {
-        // 다운로드 목록을 못 가져와도 대괄호만 있는 제목으로 업로드는 계속 진행 가능
-      });
-
-    getYoutubePlaylists()
-      .then((playlists) => {
-        playlistInput.innerHTML = '<option value="">추가 안 함</option>';
-        for (const playlist of playlists) {
-          const option = document.createElement('option');
-          option.value = playlist.id;
-          option.textContent = playlist.title;
-          playlistInput.appendChild(option);
-        }
-        chrome.storage.local.get(['lastYoutubePlaylistId']).then(({ lastYoutubePlaylistId }) => {
-          if (lastYoutubePlaylistId && playlists.some((p) => p.id === lastYoutubePlaylistId)) {
-            playlistInput.value = lastYoutubePlaylistId;
-          }
-        });
-      })
-      .catch((error) => {
-        playlistInput.innerHTML = `<option value="">추가 안 함 (목록 조회 실패: ${escapeHtml(error.message)})</option>`;
-      });
-
-    let selectedFile = null;
-
-    fileInput.addEventListener('change', () => {
-      selectedFile = fileInput.files[0] || null;
-      startButton.disabled = !selectedFile;
-      statusEl.textContent = '';
-      statusEl.classList.remove('error');
-    });
-
-    startButton.addEventListener('click', () => {
-      if (!selectedFile) return;
-
-      const playlistId = playlistInput.value || null;
-      chrome.storage.local.set({ lastYoutubePlaylistId: playlistId || '' });
-
-      startButton.disabled = true;
-      fileInput.disabled = true;
-      titleInput.disabled = true;
-      descriptionTextarea.disabled = true;
-      privacySelect.disabled = true;
-      playlistInput.disabled = true;
-      progressEl.style.display = 'block';
-      progressFill.style.width = '0%';
-      statusEl.classList.remove('error');
-      statusEl.textContent = '업로드 준비 중...';
-
-      activeYoutubeUploadCount += 1;
-
-      startYoutubeUpload({
-        file: selectedFile,
-        title: titleInput.value.trim() || `[${meta.label}]`,
-        description: descriptionTextarea.value,
-        privacy: privacySelect.value,
-        playlistId,
-        onProgress: (ratio) => {
-          progressFill.style.width = `${Math.round(ratio * 100)}%`;
-          statusEl.textContent = `업로드 중... ${Math.round(ratio * 100)}%`;
-        },
-        onStatus: (text) => {
-          statusEl.textContent = text;
-        },
-        onDone: (video, playlistError) => {
-          activeYoutubeUploadCount = Math.max(0, activeYoutubeUploadCount - 1);
-          progressFill.style.width = '100%';
-          const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
-          let html = `업로드 완료: <a href="${videoUrl}" target="_blank" rel="noopener noreferrer">${videoUrl}</a>`;
-          if (playlistId) {
-            html += playlistError
-              ? `<br>재생목록 추가 실패: ${escapeHtml(playlistError)}`
-              : '<br>재생목록에 추가되었습니다.';
-          }
-          statusEl.innerHTML = html;
-          if (playlistError) statusEl.classList.add('error');
-          startButton.textContent = '업로드 완료';
-        },
-        onError: (message) => {
-          activeYoutubeUploadCount = Math.max(0, activeYoutubeUploadCount - 1);
-          statusEl.textContent = `업로드 실패: ${message}`;
-          statusEl.classList.add('error');
-          startButton.textContent = '재시도';
-          startButton.disabled = false;
-          fileInput.disabled = false;
-          titleInput.disabled = false;
-          descriptionTextarea.disabled = false;
-          privacySelect.disabled = false;
-          playlistInput.disabled = false;
-        },
-      });
-    });
-
-    return form;
-  }
-
-  // Google 리줌 업로드는 청크 크기가 256KiB의 배수여야 한다(마지막 청크 제외). 4MiB.
-  const YOUTUBE_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
-
-  /**
-   * ArrayBuffer를 base64 문자열로 변환한다.
-   * chrome.runtime 메시징은 JSON 직렬화만 지원해 ArrayBuffer/Uint8Array를 그대로
-   * 보내면 빈 객체({})로 도착한다(실제로 겪은 문제 - 몇 바이트짜리 body만 전송됨).
-   * 문자열로 바꿔 보내는 게 JSON으로도 안전하게 전달되는 유일한 방법이다.
-   */
-  function arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const chunkSize = 0x8000; // String.fromCharCode 호출 인자 개수 제한 회피
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-  }
-
-  /**
-   * background의 'youtubeUpload' 포트로 파일을 청크(base64 문자열) 단위로 전달해
-   * 업로드를 진행시킨다. 실제 googleapis.com 요청(토큰 발급 포함)은 background에서
-   * 수행한다. File/Blob이나 ArrayBuffer를 그대로 넘기지 않는다 — chrome.runtime
-   * 메시징은 JSON 직렬화만 지원해서 바이너리 데이터가 유실된다(실제로 겪은 문제).
-   */
-  function startYoutubeUpload({ file, title, description, privacy, playlistId, onProgress, onStatus, onDone, onError }) {
-    let port;
-    try {
-      port = chrome.runtime.connect({ name: 'youtubeUpload' });
-    } catch (error) {
-      onError('확장 프로그램과 연결할 수 없습니다.');
-      return;
-    }
-
-    let offset = 0;
-
-    const sendNextChunk = async () => {
-      const end = Math.min(offset + YOUTUBE_UPLOAD_CHUNK_SIZE, file.size);
-      const isLast = end >= file.size;
-      let data;
-      try {
-        const buffer = await file.slice(offset, end).arrayBuffer();
-        data = arrayBufferToBase64(buffer);
-      } catch (error) {
-        onError('파일을 읽는 중 오류가 발생했습니다.');
-        port.disconnect();
-        return;
-      }
-      port.postMessage({ type: 'chunk', data, start: offset, end, isLast });
-      offset = end;
-    };
-
-    port.onMessage.addListener((message) => {
-      if (message?.type === 'ready') {
-        sendNextChunk();
-      } else if (message?.type === 'chunkAck') {
-        sendNextChunk();
-      } else if (message?.type === 'progress') {
-        onProgress(message.ratio);
-      } else if (message?.type === 'status') {
-        onStatus(message.message);
-      } else if (message?.type === 'done') {
-        onDone(message.video, message.playlistError);
-        port.disconnect();
-      } else if (message?.type === 'error') {
-        onError(message.message);
-        port.disconnect();
-      }
-    });
-
-    port.onDisconnect.addListener(() => {
-      if (chrome.runtime.lastError) {
-        onError(chrome.runtime.lastError.message || '업로드 연결이 끊어졌습니다.');
-      }
-    });
-
-    port.postMessage({
-      type: 'start',
-      title,
-      description,
-      privacy,
-      playlistId,
-      fileName: file.name,
-      fileType: file.type,
-      fileSize: file.size,
-    });
   }
 
   /**
@@ -659,7 +404,7 @@
 
   function setupDownloadUI(item, meta, videoId, getDownloadFileList) {
     const downloadButton = item.querySelector('.download-button');
-    const statusEl = item.querySelector('.download-status');
+    const statusEl = item.querySelector('.file-status');
 
     downloadButton.addEventListener('click', async () => {
       downloadButton.disabled = true;

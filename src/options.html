@@ -127,8 +127,31 @@
       </div>
       <p class="card-desc">
         VOD 재생 페이지에 작은 패널을 표시해, 해당 VOD를 구성하는 파일별 방송 당시 시작·종료 시각과
-        길이를 보여줍니다. 유튜브 업로드 시 설명란에 넣을 방송 시간 메타데이터를 빠르게 복사할 때 유용합니다.
+        길이를 보여주고, 다운로드와 YouTube Studio 업로드 창 열기(제목/설명 자동 입력)를 도와줍니다.
+        아래는 Studio 업로드 창에서 매번 클릭하지 않아도 되도록 자동으로 적용할 옵션입니다.
       </p>
+      <div class="card-body" id="vodFileInfoBody">
+        <div class="field">
+          <label for="youtubeVisibility">공개 범위</label>
+          <select id="youtubeVisibility">
+            <option value="private">비공개</option>
+            <option value="unlisted">일부 공개</option>
+            <option value="public">공개</option>
+          </select>
+        </div>
+        <div class="field">
+          <label class="checkbox-label"><input type="checkbox" id="youtubeNotForKids"> "아동용이 아닙니다" 자동 선택</label>
+        </div>
+        <div class="field">
+          <label>추가할 재생목록 (여러 개 가능, Studio에 보이는 이름과 정확히 같아야 합니다)</label>
+          <div class="input-group">
+            <input type="text" id="newYoutubePlaylist" placeholder="예: 노래방 다시보기">
+            <button id="addYoutubePlaylistBtn" class="btn-primary">추가</button>
+          </div>
+        </div>
+        <ul class="streamer-list" id="youtubePlaylistList"></ul>
+        <p class="empty-hint" id="youtubePlaylistEmptyHint">등록된 재생목록이 없습니다. (재생목록을 자동 선택하지 않습니다)</p>
+      </div>
     </section>
 
     <div id="toast" class="toast"></div>
