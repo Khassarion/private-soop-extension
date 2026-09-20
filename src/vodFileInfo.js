@@ -185,7 +185,7 @@
       const copyButton = item.querySelector('.copy-button');
       copyButton.addEventListener('click', () => copyToClipboard(meta.text, copyButton, '정보 복사'));
 
-      setupUploadUI(item, meta, getDownloadFileList);
+      setupUploadUI(item, meta, videoId, getDownloadFileList);
       setupDownloadUI(item, meta, videoId, getDownloadFileList);
 
       list.appendChild(item);
@@ -279,7 +279,7 @@
    * (파일 자체는 브라우저가 로컬 경로 접근을 막고 확장 메시징으로 큰 바이너리를 옮길 수도
    * 없어서, Studio의 "파일 선택"에서 사용자가 직접 고르는 단계가 남는다.)
    */
-  function setupUploadUI(item, meta, getDownloadFileList) {
+  function setupUploadUI(item, meta, videoId, getDownloadFileList) {
     const uploadButton = item.querySelector('.upload-button');
     const statusEl = item.querySelector('.file-status');
 
@@ -292,24 +292,35 @@
         // 다운로드용 파일 목록에서 원본 방송 제목을 얻을 수 있으면 뒤에 붙이고,
         // 못 얻으면(로그인 문제 등) 대괄호 부분만으로 진행한다.
         let title = `[${meta.label}]`;
+        // Studio 업로드 창에 자동 첨부할 파일의 후보 이름: 우리 다운로드 버튼으로 받았을 때
+        // 기록해둔 실제 저장 이름(브라우저가 바꿨을 수 있음) + Soop이 알려준 원래 파일명.
+        const fileNames = [];
         try {
           const fileList = await getDownloadFileList();
           const entry = fileList.find((f) => Number(f.file_order) === meta.index + 1);
           const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
           if (contentTitle) title = `${title} ${contentTitle}`;
+
+          if (entry) {
+            const { downloadedFiles } = await chrome.storage.local.get(['downloadedFiles']);
+            const savedName = downloadedFiles?.[downloadRecordKey(videoId, entry.file_order)]?.name;
+            if (savedName) fileNames.push(savedName);
+            if (entry.file_name && !fileNames.includes(entry.file_name)) fileNames.push(entry.file_name);
+          }
         } catch (_error) {
-          // 대괄호만 있는 제목 유지
+          // 대괄호만 있는 제목 유지, 파일 자동 첨부는 건너뛴다(직접 선택)
         }
 
         const response = await chrome.runtime.sendMessage({
           action: 'youtubeStudio:open',
           title,
           description: meta.descriptionText,
+          fileNames,
         });
         if (!response?.success) {
           throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
         }
-        statusEl.textContent = 'Studio 업로드 창을 열었습니다. mp4를 선택하면 제목/설명이 자동으로 입력됩니다.';
+        statusEl.textContent = 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.';
       } catch (error) {
         statusEl.textContent = `업로드 창 열기 실패: ${error.message}`;
         statusEl.classList.add('error');
@@ -395,8 +406,19 @@
     return data.DOWN_URL;
   }
 
-  async function startBrowserDownload(url, filename) {
-    const response = await chrome.runtime.sendMessage({ action: 'download:start', url, filename });
+  // 다운로드한 파일의 실제 저장 이름을 기록해두는 키 (background가 완료 시 기록, 업로드 시 읽음)
+  function downloadRecordKey(videoId, fileOrder) {
+    return `${videoId}:${Number(fileOrder)}`;
+  }
+
+  async function startBrowserDownload(url, filename, record) {
+    const response = await chrome.runtime.sendMessage({
+      action: 'download:start',
+      url,
+      filename,
+      videoId: record.videoId,
+      fileOrder: record.fileOrder,
+    });
     if (!response?.success) {
       throw new Error(response?.error || '다운로드를 시작하지 못했습니다.');
     }
@@ -423,7 +445,7 @@
         const downUrl = await requestDownloadUrl(videoId, entry.file_order, quality.name, entry.file_name);
 
         statusEl.textContent = '다운로드 시작...';
-        await startBrowserDownload(downUrl, entry.file_name);
+        await startBrowserDownload(downUrl, entry.file_name, { videoId, fileOrder: Number(entry.file_order) });
         statusEl.textContent = '다운로드가 시작되었습니다 (브라우저 다운로드 목록 확인).';
       } catch (error) {
         statusEl.textContent = `다운로드 실패: ${error.message}`;

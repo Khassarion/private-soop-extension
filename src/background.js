@@ -47,6 +47,7 @@ const DEFAULT_SETTINGS = {
       youtubeVisibility: 'unlisted', // 'private' | 'unlisted' | 'public'
       youtubeNotForKids: true,
       youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
+      downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
     },
   },
 };
@@ -121,6 +122,51 @@ async function getPendingStudioUploads() {
 async function setPendingStudioUploads(pendingStudioUploads) {
   await chrome.storage.session.set({ pendingStudioUploads });
 }
+
+/**
+ * 다운로드 하위 폴더 설정을 안전한 상대 경로로 정리한다 ("..", 절대경로, 드라이브 문자 등 제거).
+ * chrome.downloads의 filename은 Chrome 다운로드 폴더 기준 상대 경로만 허용한다.
+ */
+function normalizeSubfolder(value) {
+  return String(value || '')
+    .split(/[\\/]+/)
+    .map((part) => part.trim().replace(/[<>:"|?*]/g, '_'))
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/');
+}
+
+// 다운로드가 끝나면 브라우저가 실제로 저장한 파일 이름을 기록해둔다. 특수문자 치환이나
+// 중복 시 "(1)" 접미사 때문에 Soop이 알려준 이름과 달라질 수 있어서, 업로드 때 Studio에
+// 자동 첨부할 파일을 찾는 데 이 이름을 쓴다. 서비스 워커는 다운로드 도중 종료될 수 있어
+// 추적 정보는 메모리가 아니라 chrome.storage.local에 둔다.
+async function trackDownload(downloadId, videoId, fileOrder) {
+  const { pendingDownloads = {} } = await chrome.storage.local.get(['pendingDownloads']);
+  pendingDownloads[downloadId] = { videoId, fileOrder: Number(fileOrder) };
+  await chrome.storage.local.set({ pendingDownloads });
+}
+
+chrome.downloads.onChanged.addListener(async (delta) => {
+  const state = delta.state?.current;
+  if (state !== 'complete' && state !== 'interrupted') return;
+
+  const { pendingDownloads = {}, downloadedFiles = {} } = await chrome.storage.local.get([
+    'pendingDownloads',
+    'downloadedFiles',
+  ]);
+  const tracked = pendingDownloads[delta.id];
+  if (!tracked) return;
+  delete pendingDownloads[delta.id];
+
+  if (state === 'complete') {
+    const [item] = await chrome.downloads.search({ id: delta.id });
+    if (item?.filename) {
+      const name = item.filename.split(/[\\/]/).pop();
+      downloadedFiles[`${tracked.videoId}:${tracked.fileOrder}`] = { name, savedAt: Date.now() };
+      console.log(`${STUDIO_LOG_TAG} 다운로드 완료 기록: ${tracked.videoId}:${tracked.fileOrder} → ${name}`);
+    }
+  }
+  await chrome.storage.local.set({ pendingDownloads, downloadedFiles });
+});
 
 /**
  * 새로 연 라이브 탭에 주었던 임시 포커스를 원래 보고 있던 탭으로 되돌립니다.
@@ -376,7 +422,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       try {
         const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
         const pending = await getPendingStudioUploads();
-        pending[tab.id] = { title: request.title, description: request.description };
+        pending[tab.id] = {
+          title: request.title,
+          description: request.description,
+          fileNames: Array.isArray(request.fileNames) ? request.fileNames : [],
+        };
         await setPendingStudioUploads(pending);
         console.log(`${STUDIO_LOG_TAG} 업로드 탭 열림 (tabId=${tab.id}), 제목: ${request.title}`);
         sendResponse({ success: true });
@@ -403,6 +453,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         pending: true,
         title: entry.title,
         description: entry.description,
+        fileNames: entry.fileNames || [],
+        downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
         options: {
           visibility: vodFileInfo.youtubeVisibility,
           notForKids: vodFileInfo.youtubeNotForKids,
@@ -416,10 +468,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'download:start') {
     (async () => {
       try {
+        const { vodFileInfo } = (await getSettings()).features;
+        const subfolder = normalizeSubfolder(vodFileInfo.downloadSubfolder);
+        const safeName = String(request.filename).replace(/[\\/]/g, '_');
         const downloadId = await chrome.downloads.download({
           url: request.url,
-          filename: request.filename,
+          filename: subfolder ? `${subfolder}/${safeName}` : safeName,
         });
+        if (request.videoId != null && request.fileOrder != null) {
+          await trackDownload(downloadId, request.videoId, request.fileOrder);
+        }
         sendResponse({ success: true, downloadId });
       } catch (error) {
         console.error('[download] 다운로드 시작 오류:', error);

@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = {
       youtubeVisibility: 'unlisted', // 'private' | 'unlisted' | 'public'
       youtubeNotForKids: true,
       youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
+      downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
     },
   },
 };
@@ -64,6 +65,7 @@ const el = {
 
   vodFileInfoEnabled: document.getElementById('vodFileInfoEnabled'),
   vodFileInfoBody: document.getElementById('vodFileInfoBody'),
+  downloadSubfolder: document.getElementById('downloadSubfolder'),
   youtubeVisibility: document.getElementById('youtubeVisibility'),
   youtubeNotForKids: document.getElementById('youtubeNotForKids'),
   newYoutubePlaylist: document.getElementById('newYoutubePlaylist'),
@@ -118,6 +120,7 @@ function renderAll() {
 
   const vodFileInfo = settings.features.vodFileInfo;
   el.vodFileInfoEnabled.checked = vodFileInfo.enabled;
+  el.downloadSubfolder.value = vodFileInfo.downloadSubfolder;
   el.youtubeVisibility.value = vodFileInfo.youtubeVisibility;
   el.youtubeNotForKids.checked = vodFileInfo.youtubeNotForKids;
   updateCardBodyState(el.vodFileInfoBody, vodFileInfo.enabled);
@@ -294,6 +297,13 @@ function setupEventListeners() {
     persistSettings();
   });
 
+  el.downloadSubfolder.addEventListener('change', (e) => {
+    const normalized = normalizeSubfolder(e.target.value);
+    e.target.value = normalized;
+    settings.features.vodFileInfo.downloadSubfolder = normalized;
+    persistSettings();
+  });
+
   el.youtubeVisibility.addEventListener('change', (e) => {
     settings.features.vodFileInfo.youtubeVisibility = e.target.value;
     persistSettings();
@@ -327,6 +337,15 @@ function handleAddStreamer() {
   el.newStreamerId.value = '';
   persistSettings();
   renderStreamerList();
+}
+
+// background.js의 normalizeSubfolder와 같은 규칙 (Chrome 다운로드 폴더 기준 상대 경로만 허용)
+function normalizeSubfolder(value) {
+  return String(value || '')
+    .split(/[\\/]+/)
+    .map((part) => part.trim().replace(/[<>:"|?*]/g, '_'))
+    .filter((part) => part && part !== '.' && part !== '..')
+    .join('/');
 }
 
 function clampInt(value, min, max, fallback) {

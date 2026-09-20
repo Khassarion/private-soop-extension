@@ -1,9 +1,9 @@
 /**
  * Content Script: YouTube Studio 업로드 창 자동 입력
- * VOD 페이지의 "유튜브에 업로드" 버튼이 background를 통해 이 탭에 맡겨둔 제목/설명과
- * 설정 페이지에 저장해둔 옵션(아동용 아님, 재생목록, 공개 범위)을, 사용자가 Studio 업로드
- * 창에서 mp4를 고른 뒤 나타나는 화면에 자동으로 입력/선택한다. 마지막 "저장" 클릭은
- * 사용자가 직접 한다.
+ * VOD 페이지의 "유튜브에 업로드" 버튼이 background를 통해 이 탭에 맡겨둔 제목/설명/파일명과
+ * 설정 페이지에 저장해둔 옵션(아동용 아님, 재생목록, 공개 범위)을, Studio 업로드 창에 자동으로
+ * 입력/선택한다. 다운로드 폴더를 연결해두면 mp4 파일도 자동으로 첨부한다. 마지막 "저장"
+ * 클릭은 사용자가 직접 한다.
  * 백그라운드가 직접 연 탭에서만 동작하며(youtubeStudio:init 응답이 pending일 때),
  * 사용자가 평소에 쓰는 Studio 탭에는 아무 영향이 없다.
  *
@@ -23,10 +23,17 @@
   const VERIFY_DELAY_MS = 1000;
   const MAX_FILL_ATTEMPTS = 4;
   const STEP_WAIT_MS = 5000;
+  // 재생목록 창은 열린 직후엔 비어 있다가 계정의 재생목록을 불러온 뒤에야 채워진다.
+  const PLAYLIST_LOAD_TIMEOUT_MS = 20000; // 목록이 나타나길 기다리는 최대 시간
+  const PLAYLIST_STABLE_MS = 800; // 행 개수가 이만큼 변하지 않으면 다 불러온 것으로 본다
+  const PLAYLIST_ROW_GRACE_MS = 3000; // 다 불러온 뒤에도 못 찾은 이름을 마지막으로 기다리는 시간
+  // 파일을 input에 넣은 뒤 Studio가 상세 화면으로 넘어가지 않으면 반응하지 않은 것으로 본다.
+  const ATTACH_REACTION_TIMEOUT_MS = 15000;
 
   // 모든 자동 입력/선택은 반드시 "업로드 창" 안에서만 한다 — 이미 올라간 영상의 편집
   // 화면에도 같은 입력칸이 있어서, 범위를 제한하지 않으면 엉뚱한 영상을 건드릴 수 있다.
   const UPLOAD_DIALOG_SELECTOR = 'ytcp-uploads-dialog';
+  const FILE_INPUT_SELECTOR = 'input[type="file"]';
   const TITLE_SELECTORS = [
     '#title-textarea #textbox',
     'ytcp-video-title #textbox',
@@ -53,9 +60,25 @@
   const VISIBILITY_STEP_BADGE_SELECTOR = '#step-badge-3';
   const NEXT_BUTTON_SELECTOR = '#next-button';
 
+  // 연결한 다운로드 폴더 핸들은 이 페이지(studio.youtube.com) 출처의 IndexedDB에 보관한다.
+  // 폴더 핸들은 확장 프로그램 페이지(설정 페이지 등)와 이 페이지 사이에 옮길 수 없다.
+  const DB_NAME = 'private-extension-vod-upload';
+  const DB_STORE = 'handles';
+  const DIR_HANDLE_KEY = 'downloadDir';
+
   const DEFAULT_OPTIONS = { visibility: 'unlisted', notForKids: true, playlists: [] };
 
   let bannerMessageEl = null;
+  let folderButtonEl = null;
+
+  let fileNames = []; // 자동 첨부할 파일의 후보 이름들 (VOD 페이지가 넘겨줌)
+  let downloadSubfolder = '';
+  let dirHandle = null;
+  let forcePickFolder = false; // 파일을 못 찾았을 때 다른 폴더를 고르게 하기 위함
+  let attachStarted = false;
+  let attachDone = false;
+  let attachResult = null;
+  let automationStarted = false;
 
   init();
 
@@ -69,8 +92,12 @@
     if (!response?.pending) return;
 
     const options = { ...DEFAULT_OPTIONS, ...(response.options || {}) };
-    console.log(`${LOG_TAG} 업로드용 탭으로 확인됨, 자동 입력 대기`, options);
+    fileNames = Array.isArray(response.fileNames) ? response.fileNames : [];
+    downloadSubfolder = response.downloadSubfolder || '';
+    console.log(`${LOG_TAG} 업로드용 탭으로 확인됨, 자동 입력 대기`, options, fileNames);
+
     showBanner(response.title, response.description);
+    if (fileNames.length > 0) await setupFolderAccess();
     watchUploadDialog(response.title, response.description, options);
   }
 
@@ -87,11 +114,14 @@
       const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
       if (!dialog) return;
 
+      tryAttach(); // 내부 가드가 있어 매 폴링마다 불러도 한 번만 실행된다
+
       const titleBox = findFirst(dialog, TITLE_SELECTORS);
       const descriptionBox = findFirst(dialog, DESCRIPTION_SELECTORS);
       if (!titleBox || !descriptionBox) return;
 
       clearInterval(timer);
+      automationStarted = true;
       console.log(`${LOG_TAG} 업로드 창의 제목/설명 입력칸 발견, 자동 입력 시작`);
       await runAutomation(dialog, titleBox, descriptionBox, title, description, options);
     }, POLL_INTERVAL_MS);
@@ -99,9 +129,10 @@
 
   async function runAutomation(dialog, titleBox, descriptionBox, title, description, options) {
     const results = [];
+    if (attachResult) results.push(attachResult);
     const report = () => setBannerMessage(formatResults(results, true));
 
-    setBannerMessage('제목/설명을 입력하는 중...');
+    setBannerMessage(formatResults(results, false) + '\n제목/설명을 입력하는 중...');
     const [titleOk, descriptionOk] = await Promise.all([
       fillWithVerify(titleBox, title),
       fillWithVerify(descriptionBox, description),
@@ -152,6 +183,209 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // 파일 자동 첨부 (File System Access API)
+  //
+  // 브라우저는 경로 문자열로 <input type="file">을 채우는 걸 막는다. 대신 사용자가 다운로드
+  // 폴더를 한 번 허용해주면(폴더 핸들), 그 폴더에서 파일명으로 찾은 실제 File 객체를
+  // input.files에 넣고 change 이벤트를 발생시켜 Studio가 사용자가 고른 것처럼 받게 한다.
+  // 폴더 선택창은 사용자 클릭이 있어야 열리므로 배너의 버튼으로 연결한다.
+  // ---------------------------------------------------------------------------
+
+  async function setupFolderAccess() {
+    try {
+      dirHandle = await loadDirHandle();
+    } catch (error) {
+      console.warn(`${LOG_TAG} 저장된 폴더 핸들을 불러오지 못함`, error);
+      dirHandle = null;
+    }
+    await refreshFolderButton();
+  }
+
+  async function hasReadPermission() {
+    if (!dirHandle) return false;
+    try {
+      return (await dirHandle.queryPermission({ mode: 'read' })) === 'granted';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async function refreshFolderButton() {
+    if (!folderButtonEl) return;
+    if (attachDone || (!forcePickFolder && (await hasReadPermission()))) {
+      folderButtonEl.hidden = true;
+      return;
+    }
+    folderButtonEl.hidden = false;
+    if (forcePickFolder) folderButtonEl.textContent = '📁 다른 폴더 선택 (파일을 못 찾았어요)';
+    else if (dirHandle) folderButtonEl.textContent = '📁 폴더 접근 허용 (파일 자동 첨부)';
+    else folderButtonEl.textContent = '📁 다운로드 폴더 연결 (파일 자동 첨부)';
+  }
+
+  async function onFolderButtonClick() {
+    try {
+      if (dirHandle && !forcePickFolder) {
+        const state = await dirHandle.requestPermission({ mode: 'read' });
+        if (state !== 'granted') {
+          setBannerMessage('폴더 접근이 허용되지 않았습니다.', true);
+          return;
+        }
+      } else {
+        if (!window.showDirectoryPicker) {
+          setBannerMessage('이 브라우저에서는 폴더 선택을 지원하지 않습니다. mp4를 직접 선택해주세요.', true);
+          return;
+        }
+        dirHandle = await window.showDirectoryPicker({ id: 'soop-vod-download', mode: 'read' });
+        await saveDirHandle(dirHandle);
+        forcePickFolder = false;
+      }
+    } catch (error) {
+      if (error?.name !== 'AbortError') {
+        console.warn(`${LOG_TAG} 폴더 연결 실패`, error);
+        setBannerMessage(`폴더 연결 실패: ${error.message}`, true);
+      }
+      return;
+    }
+
+    if (!attachDone) attachStarted = false; // 새 폴더/권한으로 다시 시도
+    await refreshFolderButton();
+    tryAttach();
+  }
+
+  /** 업로드 창의 파일 입력칸이 보이고 폴더 접근이 허용돼 있으면, 한 번만 파일을 넣어본다. */
+  async function tryAttach() {
+    if (attachStarted || attachDone || fileNames.length === 0 || automationStarted) return;
+
+    const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
+    const input = dialog?.querySelector(FILE_INPUT_SELECTOR);
+    if (!input) return;
+    if (!(await hasReadPermission())) return;
+    if (attachStarted || attachDone) return; // 위 await 사이에 다른 호출이 먼저 시작했을 수 있음
+
+    attachStarted = true;
+    setBannerMessage('다운로드 폴더에서 파일을 찾는 중...');
+    attachResult = await safely('파일 첨부', () => attachFile(input));
+
+    if (attachResult.ok) {
+      attachDone = true;
+      setBannerMessage(`✓ 파일 첨부 (${attachResult.detail})\nStudio가 파일을 받는 중...`);
+      await refreshFolderButton();
+      setTimeout(() => {
+        if (!automationStarted) {
+          setBannerMessage('파일을 넣었지만 Studio가 반응하지 않았습니다. mp4를 직접 선택해주세요.', true);
+        }
+      }, ATTACH_REACTION_TIMEOUT_MS);
+    } else {
+      // 폴더가 틀렸을 가능성이 커서 다른 폴더를 고를 수 있게 한다. 자동 입력은 사용자가
+      // 파일을 직접 고르면 그대로 이어진다.
+      forcePickFolder = true;
+      await refreshFolderButton();
+      setBannerMessage(
+        `✗ 파일 첨부 (${attachResult.detail})\nmp4를 직접 선택하거나 아래에서 다른 폴더를 골라주세요.`,
+        true
+      );
+    }
+  }
+
+  async function attachFile(input) {
+    const file = await findDownloadedFile();
+    if (!file) return { ok: false, detail: `폴더에서 '${fileNames[0]}'을(를) 찾지 못함` };
+
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return { ok: true, detail: file.name };
+  }
+
+  async function findDownloadedFile() {
+    const matchers = buildNameMatchers(fileNames);
+
+    const direct = await searchDirectory(dirHandle, matchers);
+    if (direct) return direct;
+
+    // 다운로드 하위 폴더를 설정해뒀는데 그 상위 폴더를 연결한 경우도 찾아준다.
+    if (downloadSubfolder) {
+      try {
+        let dir = dirHandle;
+        for (const part of downloadSubfolder.split('/').filter(Boolean)) {
+          dir = await dir.getDirectoryHandle(part);
+        }
+        return await searchDirectory(dir, matchers);
+      } catch (error) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  async function searchDirectory(directory, matchers) {
+    let newest = null;
+    for await (const entry of directory.values()) {
+      if (entry.kind !== 'file') continue;
+      if (!matchers.some((matcher) => matcher.test(entry.name))) continue;
+      const file = await entry.getFile();
+      if (!newest || file.lastModified > newest.lastModified) newest = file;
+    }
+    return newest;
+  }
+
+  /**
+   * 후보 이름마다 "이름" 또는 브라우저가 중복 시 붙이는 "이름 (1)" 형태, 그리고
+   * Windows에서 쓸 수 없는 문자가 '_'로 바뀐 형태까지 정확히 일치하는 파일만 인정한다.
+   * 부분 일치는 허용하지 않는다 — "_1.mp4"와 "_10.mp4"처럼 비슷한 다른 파일을 집을 수 있다.
+   */
+  function buildNameMatchers(names) {
+    const variants = new Set();
+    for (const name of names) {
+      variants.add(name);
+      variants.add(name.replace(/[<>:"/\\|?*]/g, '_'));
+    }
+    return Array.from(variants).map((name) => {
+      const dot = name.lastIndexOf('.');
+      const stem = dot > 0 ? name.slice(0, dot) : name;
+      const ext = dot > 0 ? name.slice(dot) : '';
+      return new RegExp(`^${escapeRegExp(stem)}( \\(\\d+\\))?${escapeRegExp(ext)}$`, 'i');
+    });
+  }
+
+  function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function openDb() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore(DB_STORE);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function loadDirHandle() {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(DIR_HANDLE_KEY);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function saveDirHandle(handle) {
+    const db = await openDb();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).put(handle, DIR_HANDLE_KEY);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Studio 화면 조작 (아동용 아님 / 재생목록 / 공개 범위)
+  // ---------------------------------------------------------------------------
+
   /** "아동용이 아닙니다" 라디오 선택 */
   async function selectNotForKids(dialog) {
     const radio = await waitFor(() => findFirst(dialog, NOT_FOR_KIDS_SELECTORS), STEP_WAIT_MS);
@@ -167,11 +401,19 @@
 
     const popup = await waitFor(() => document.querySelector(PLAYLIST_POPUP_SELECTOR), STEP_WAIT_MS);
     if (!popup) return { ok: false, detail: '재생목록 창이 열리지 않음' };
-    await sleep(600); // 목록 렌더링 대기
+
+    // 목록을 불러오기 전에 체크를 시도하면 전부 "못 찾음"이 되므로, 행이 나타나고 개수가
+    // 안정될 때까지 기다린다.
+    const loaded = await waitForPlaylistRows(popup);
+    if (!loaded) {
+      findFirst(popup, PLAYLIST_DONE_SELECTORS)?.click();
+      return { ok: false, detail: '재생목록이 불러와지지 않음' };
+    }
 
     const missing = [];
     for (const name of names) {
-      const row = findPlaylistRow(popup, name);
+      // 이미 다 불러왔다면 바로 찾고, 늦게 도착하는 항목이 있을 수 있어 못 찾으면 잠깐 더 기다린다.
+      const row = await waitFor(() => findPlaylistRow(popup, name), PLAYLIST_ROW_GRACE_MS);
       if (!row) {
         missing.push(name);
         continue;
@@ -218,13 +460,39 @@
     return { ok };
   }
 
-  function findPlaylistRow(root, name) {
-    const target = normalize(name);
+  function getPlaylistRows(root) {
     const rows = Array.from(root.querySelectorAll('li'));
     const candidates = rows.length > 0 ? rows : Array.from(root.querySelectorAll('ytcp-checkbox-lit'));
+    return candidates.filter((row) => normalize(row.textContent) !== '');
+  }
+
+  /**
+   * 재생목록 행이 하나 이상 나타나고, 행 개수가 PLAYLIST_STABLE_MS 동안 변하지 않을 때까지
+   * 기다린다(목록이 여러 번에 나눠 도착하는 경우를 위해 "나타났다"만이 아니라 "안정됐다"를 본다).
+   */
+  async function waitForPlaylistRows(popup) {
+    const startedAt = Date.now();
+    let lastCount = -1;
+    let stableSince = Date.now();
+
+    while (Date.now() - startedAt < PLAYLIST_LOAD_TIMEOUT_MS) {
+      const count = getPlaylistRows(popup).length;
+      if (count !== lastCount) {
+        lastCount = count;
+        stableSince = Date.now();
+      } else if (count > 0 && Date.now() - stableSince >= PLAYLIST_STABLE_MS) {
+        return true;
+      }
+      await sleep(200);
+    }
+    return lastCount > 0;
+  }
+
+  function findPlaylistRow(root, name) {
+    const target = normalize(name);
     // 정확히 같은 이름만 인정한다 — 부분 일치를 허용하면 비슷한 이름의 다른 재생목록에
     // 조용히 들어가 버릴 수 있다.
-    return candidates.find((row) => rowHasText(row, target)) || null;
+    return getPlaylistRows(root).find((row) => rowHasText(row, target)) || null;
   }
 
   function rowHasText(row, target) {
@@ -350,17 +618,23 @@
         .actions { display: flex; gap: 6px; }
         .copy { flex: 1; padding: 6px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #2563eb; cursor: pointer; font-size: 12px; }
         .copy:hover { background: #eff6ff; }
+        .folder { width: 100%; margin-top: 6px; padding: 7px; border: 0; border-radius: 5px; background: #2563eb; color: #fff; cursor: pointer; font-size: 12px; font-weight: 600; }
+        .folder:hover { background: #1d4ed8; }
+        .folder[hidden] { display: none; }
       </style>
       <div class="banner">
         <div class="top"><strong>🎬 VOD 업로드 도우미</strong><button class="close" id="close" title="닫기">×</button></div>
-        <p class="message" id="message">업로드 창에서 mp4 파일을 선택하면 제목/설명과 설정해둔 옵션을 자동으로 채워드립니다.</p>
+        <p class="message" id="message">업로드 창이 열리면 제목/설명과 설정해둔 옵션을 자동으로 채워드립니다. 다운로드 폴더를 연결해두면 mp4도 자동으로 첨부합니다.</p>
         <div class="actions">
           <button class="copy" id="copyTitle">제목 복사</button>
           <button class="copy" id="copyDescription">설명 복사</button>
         </div>
+        <button class="folder" id="folderButton" hidden></button>
       </div>`;
 
     bannerMessageEl = shadowRoot.getElementById('message');
+    folderButtonEl = shadowRoot.getElementById('folderButton');
+    folderButtonEl.addEventListener('click', onFolderButtonClick);
     shadowRoot.getElementById('close').addEventListener('click', () => host.remove());
     bindCopyButton(shadowRoot.getElementById('copyTitle'), title, '제목 복사');
     bindCopyButton(shadowRoot.getElementById('copyDescription'), description, '설명 복사');
