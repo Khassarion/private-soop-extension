@@ -218,6 +218,7 @@
 
     return {
       index,
+      fileOrder: Number(file.file_order),
       label,
       startText,
       endText,
@@ -297,7 +298,7 @@
         const fileNames = [];
         try {
           const fileList = await getDownloadFileList();
-          const entry = fileList.find((f) => Number(f.file_order) === meta.index + 1);
+          const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
           const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
           if (contentTitle) title = `${title} ${contentTitle}`;
 
@@ -320,7 +321,9 @@
         if (!response?.success) {
           throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
         }
-        statusEl.textContent = 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.';
+        statusEl.textContent = response.reused
+          ? '열려 있는 Studio 탭에서 새 업로드를 시작했습니다. 파일이 자동으로 첨부되지 않으면 mp4를 직접 선택하세요.'
+          : 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.';
       } catch (error) {
         statusEl.textContent = `업로드 창 열기 실패: ${error.message}`;
         statusEl.classList.add('error');
@@ -435,7 +438,7 @@
 
       try {
         const fileList = await getDownloadFileList();
-        const entry = fileList.find((f) => Number(f.file_order) === meta.index + 1);
+        const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
         if (!entry) throw new Error('다운로드 가능한 파일 정보를 찾을 수 없습니다.');
 
         const quality = entry.file_low?.[0];

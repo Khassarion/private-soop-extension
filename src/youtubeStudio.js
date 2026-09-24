@@ -6,6 +6,9 @@
  * 클릭은 사용자가 직접 한다.
  * 백그라운드가 직접 연 탭에서만 동작하며(youtubeStudio:init 응답이 pending일 때),
  * 사용자가 평소에 쓰는 Studio 탭에는 아무 영향이 없다.
+ * 업로드 창이 비어 있는(저장까지 끝난) 탭은 새 업로드를 위해 재사용된다: background가
+ * youtubeStudio:probe로 물어보고, 가능하면 youtubeStudio:restart로 이 탭에서 "동영상 업로드"를
+ * 다시 눌러 새 데이터로 같은 자동 입력을 진행한다. 진행 중이거나 저장 전인 탭은 절대 건드리지 않는다.
  *
  * 주의: Studio 화면의 DOM 구조에 기대는 코드라 유튜브가 UI를 바꾸면 아래 셀렉터를
  * 고쳐야 할 수 있다. 각 단계는 독립적으로 실패해도 다른 단계를 막지 않고, 결과를
@@ -59,6 +62,19 @@
   const VISIBILITY_LABELS = { private: '비공개', unlisted: '일부 공개', public: '공개' };
   const VISIBILITY_STEP_BADGE_SELECTOR = '#step-badge-3';
   const NEXT_BUTTON_SELECTOR = '#next-button';
+  const DONE_BUTTON_SELECTOR = '#done-button';
+
+  // 이미 열려 있는 Studio 탭에서 새 업로드를 시작할 때 쓰는 "만들기 → 동영상 업로드" 메뉴,
+  // 그리고 저장 후 남아 있을 수 있는 완료 화면을 닫는 버튼
+  // 콘솔에서 `button[aria-label="만들기"]`.click() → `#text-item-0`.click() 순서로 업로드 창이 열리는 것을 확인했다.
+  const CREATE_BUTTON_SELECTORS = ['button[aria-label="만들기"]', 'button[aria-label="Create"]', '#create-icon'];
+  const UPLOAD_MENU_ITEM_SELECTORS = ['tp-yt-paper-item#text-item-0', '#text-item-0'];
+  const UPLOAD_MENU_ITEM_TEXTS = ['동영상 업로드', 'Upload videos', 'Upload video'];
+  const DIALOG_CLOSE_BUTTON_SELECTORS = ['#close-button', 'ytcp-button#close-button'];
+  const DIALOG_CLOSE_BUTTON_TEXTS = ['닫기', 'Close'];
+  const OPEN_DIALOG_TIMEOUT_MS = 8000;
+  // 저장 후 업로드 창 대신(또는 뒤이어) 뜰 수 있는 "동영상 게시됨" 공유 창
+  const SHARE_DIALOG_SELECTOR = 'ytcp-video-share-dialog';
 
   // 연결한 다운로드 폴더 핸들은 이 페이지(studio.youtube.com) 출처의 IndexedDB에 보관한다.
   // 폴더 핸들은 확장 프로그램 페이지(설정 페이지 등)와 이 페이지 사이에 옮길 수 없다.
@@ -71,14 +87,28 @@
   let bannerMessageEl = null;
   let folderButtonEl = null;
 
+  // 현재 진행 중인(또는 마지막) 업로드 실행의 데이터와 상태. 같은 탭에서 새 업로드를 시작하면
+  // (youtubeStudio:restart) beginRun이 이 값들을 통째로 새로 채운다.
+  let currentTitle = '';
+  let currentDescription = '';
+  let currentOptions = DEFAULT_OPTIONS;
   let fileNames = []; // 자동 첨부할 파일의 후보 이름들 (VOD 페이지가 넘겨줌)
   let downloadSubfolder = '';
   let dirHandle = null;
+  let folderLoaded = false;
   let forcePickFolder = false; // 파일을 못 찾았을 때 다른 폴더를 고르게 하기 위함
   let attachStarted = false;
   let attachDone = false;
   let attachResult = null;
   let automationStarted = false;
+
+  // 'waiting'(업로드 창/파일 대기) → 'automating'(자동 입력 중) → 'ready'(입력 끝, 사용자의 저장 대기)
+  // → 'saved'(저장 클릭). 재사용 가능 여부 판단에 쓴다.
+  let runPhase = 'waiting';
+  let dialogEverSeen = false;
+  let watchTimer = null;
+  let currentRunId = 0; // 재시작 후 이전 실행의 늦은 콜백이 끼어들지 못하게 하는 세대 번호
+  const saveWatchedDialogs = new WeakSet();
 
   init();
 
@@ -91,28 +121,194 @@
     }
     if (!response?.pending) return;
 
-    const options = { ...DEFAULT_OPTIONS, ...(response.options || {}) };
-    fileNames = Array.isArray(response.fileNames) ? response.fileNames : [];
-    downloadSubfolder = response.downloadSubfolder || '';
-    console.log(`${LOG_TAG} 업로드용 탭으로 확인됨, 자동 입력 대기`, options, fileNames);
-
-    showBanner(response.title, response.description);
-    if (fileNames.length > 0) await setupFolderAccess();
-    watchUploadDialog(response.title, response.description, options);
+    // 우리가 연 탭에서만 background의 재사용 요청(probe/restart)에 응답한다.
+    chrome.runtime.onMessage.addListener(handleBackgroundMessage);
+    showBanner();
+    await beginRun(response);
   }
 
-  function watchUploadDialog(title, description, options) {
+  /** 새 업로드 데이터로 상태를 초기화하고 업로드 창 감시를 (다시) 시작한다. */
+  async function beginRun(payload) {
+    stopWatching();
+    currentRunId += 1;
+
+    currentTitle = payload.title;
+    currentDescription = payload.description;
+    currentOptions = { ...DEFAULT_OPTIONS, ...(payload.options || {}) };
+    fileNames = Array.isArray(payload.fileNames) ? payload.fileNames : [];
+    downloadSubfolder = payload.downloadSubfolder || '';
+    forcePickFolder = false;
+    attachStarted = false;
+    attachDone = false;
+    attachResult = null;
+    automationStarted = false;
+    runPhase = 'waiting';
+
+    console.log(`${LOG_TAG} 업로드 실행 시작`, currentTitle, currentOptions, fileNames);
+    setBannerMessage(
+      '업로드 창이 열리면 제목/설명과 설정해둔 옵션을 자동으로 채워드립니다.' +
+        (fileNames.length > 0 ? ' 다운로드 폴더를 연결해두면 mp4도 자동으로 첨부합니다.' : '')
+    );
+
+    if (fileNames.length > 0 && !folderLoaded) await setupFolderAccess();
+    else await refreshFolderButton();
+    startWatching();
+  }
+
+  function handleBackgroundMessage(request, sender, sendResponse) {
+    if (request?.action === 'youtubeStudio:probe') {
+      sendResponse({ reusable: isReusable() });
+      return false;
+    }
+    if (request?.action === 'youtubeStudio:restart') {
+      restartInThisTab(request.payload).then(sendResponse);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 이 탭에서 새 업로드를 시작해도 되는지. 자동 입력 중이거나, 업로드 창이 열려 있는데 아직
+   * 저장을 누르지 않았다면(파일 선택 대기 포함) 진행 중인 작업이므로 재사용하지 않는다.
+   * 업로드 창을 한 번도 못 본 탭(막 열려서 아직 창이 뜨기 전)도 안전하게 재사용하지 않는다.
+   */
+  function isReusable() {
+    if (runPhase === 'automating') return false;
+    const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
+    if (dialog) {
+      dialogEverSeen = true;
+      return runPhase === 'saved'; // 저장 후 남아 있는 완료 화면만 닫고 재사용할 수 있다
+    }
+    return dialogEverSeen || runPhase !== 'waiting';
+  }
+
+  async function restartInThisTab(payload) {
+    const failWith = (reason) => {
+      console.warn(`${LOG_TAG} 이 탭에서 새 업로드를 시작하지 못함: ${reason}`);
+      setBannerMessage(`이 탭에서 새 업로드를 시작하지 못했습니다 (${reason}). 새 탭으로 열립니다.`, true);
+      return { started: false, reason };
+    };
+
+    try {
+      if (!isReusable()) return { started: false, reason: '진행 중인 업로드가 있음' };
+
+      showBanner(); // 사용자가 배너를 닫았어도 다시 보이게
+      setBannerMessage('새 업로드를 시작하는 중...');
+
+      // 이전 실행의 감시를 먼저 멈춘다 — 새로 열릴 업로드 창에 이전 데이터가 입력되면 안 된다.
+      stopWatching();
+      currentRunId += 1;
+
+      const leftover = document.querySelector(UPLOAD_DIALOG_SELECTOR);
+      if (leftover && !(await closeFinishedDialog(leftover))) {
+        return failWith('이전 업로드 완료 화면을 닫지 못함');
+      }
+      const share = document.querySelector(SHARE_DIALOG_SELECTOR);
+      if (share && !(await closeFinishedDialog(share, SHARE_DIALOG_SELECTOR))) {
+        return failWith('이전 업로드 완료 화면을 닫지 못함');
+      }
+      const opened = await openUploadDialog();
+      if (!opened.ok) return failWith(opened.reason);
+
+      dialogEverSeen = true;
+      await beginRun(payload);
+      return { started: true };
+    } catch (error) {
+      console.warn(`${LOG_TAG} 재시작 중 오류`, error);
+      return failWith('오류 발생');
+    }
+  }
+
+  /** 저장 후 남아 있는 완료 화면을 닫는다. 저장 전(=진행 중) 창은 isReusable이 이미 걸러낸다. */
+  async function closeFinishedDialog(dialog, selector = UPLOAD_DIALOG_SELECTOR) {
+    const button = findFirst(dialog, DIALOG_CLOSE_BUTTON_SELECTORS) || findButtonByText(dialog, DIALOG_CLOSE_BUTTON_TEXTS);
+    if (button) button.click();
+    return Boolean(await waitFor(() => !document.querySelector(selector), STEP_WAIT_MS));
+  }
+
+  /**
+   * 상단 "만들기" 버튼을 눌러 메뉴를 연 뒤 "동영상 업로드"(#text-item-0)를 눌러 업로드 창을 연다.
+   * 실패 시 어느 단계에서 막혔는지 reason으로 알려준다(Studio 화면 구조가 바뀌었을 때 원인을 바로 알 수 있게).
+   */
+  async function openUploadDialog() {
+    const createButton = await waitFor(() => findVisible(document, CREATE_BUTTON_SELECTORS), STEP_WAIT_MS);
+    if (!createButton) return { ok: false, reason: '"만들기" 버튼을 찾지 못함' };
+    createButton.click();
+
+    // 메뉴 항목이 DOM에는 숨겨진 채로 미리 있을 수 있어, 먼저 "보이는" 항목이 나타나길 기다린다.
+    // 끝내 안 보이면 같은 id의 첫 번째 요소를 그대로 누른다(콘솔에서 이 방식으로 동작 확인).
+    const item =
+      (await waitFor(findUploadMenuItem, STEP_WAIT_MS)) || document.querySelectorAll('#text-item-0')[0];
+    if (!item) {
+      console.warn(`${LOG_TAG} "동영상 업로드" 메뉴 항목을 찾지 못함. 메뉴 항목:`, listMenuItemTexts());
+      return { ok: false, reason: '"만들기" 메뉴에서 "동영상 업로드" 항목을 찾지 못함' };
+    }
+
+    console.log(`${LOG_TAG} "동영상 업로드" 메뉴 항목 클릭`, item);
+    item.click();
+    if (await waitFor(() => document.querySelector(UPLOAD_DIALOG_SELECTOR), OPEN_DIALOG_TIMEOUT_MS)) {
+      return { ok: true };
+    }
+    return { ok: false, reason: '"동영상 업로드"를 눌렀지만 업로드 창이 열리지 않음' };
+  }
+
+  function findUploadMenuItem() {
+    return findMenuItemByText(UPLOAD_MENU_ITEM_TEXTS) || findVisible(document, UPLOAD_MENU_ITEM_SELECTORS);
+  }
+
+  function listMenuItemTexts() {
+    return Array.from(document.querySelectorAll('tp-yt-paper-item, [role="menuitem"]')).map(
+      (el) => `${normalize(el.textContent)}${isVisible(el) ? '' : ' (숨김)'}`
+    );
+  }
+
+  function isVisible(el) {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  /** 셀렉터 목록 중 화면에 실제로 보이는 첫 요소 */
+  function findVisible(root, selectors) {
+    for (const selector of selectors) {
+      const match = Array.from(root.querySelectorAll(selector)).find(isVisible);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  function findMenuItemByText(texts) {
+    const wanted = texts.map(normalize);
+    const items = document.querySelectorAll('tp-yt-paper-item, [role="menuitem"]');
+    return (
+      Array.from(items).find((el) => {
+        if (!isVisible(el)) return false;
+        const label = normalize(el.textContent);
+        return wanted.some((w) => label === w || label.startsWith(w));
+      }) || null
+    );
+  }
+
+  function stopWatching() {
+    if (watchTimer) clearInterval(watchTimer);
+    watchTimer = null;
+  }
+
+  function startWatching() {
+    const runId = currentRunId;
     const startedAt = Date.now();
 
-    const timer = setInterval(async () => {
+    watchTimer = setInterval(async () => {
+      if (runId !== currentRunId) return; // 재시작으로 무효가 된 이전 실행
+
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
-        clearInterval(timer);
+        stopWatching();
         setBannerMessage('업로드 창을 찾지 못해 자동 입력을 중단했습니다. 아래 버튼으로 복사해 붙여넣어주세요.', true);
         return;
       }
 
       const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
       if (!dialog) return;
+      dialogEverSeen = true;
 
       tryAttach(); // 내부 가드가 있어 매 폴링마다 불러도 한 번만 실행된다
 
@@ -120,22 +316,43 @@
       const descriptionBox = findFirst(dialog, DESCRIPTION_SELECTORS);
       if (!titleBox || !descriptionBox) return;
 
-      clearInterval(timer);
+      stopWatching();
       automationStarted = true;
+      runPhase = 'automating';
+      watchForSave(dialog);
       console.log(`${LOG_TAG} 업로드 창의 제목/설명 입력칸 발견, 자동 입력 시작`);
-      await runAutomation(dialog, titleBox, descriptionBox, title, description, options);
+
+      await runAutomation(dialog, titleBox, descriptionBox);
+      if (runId === currentRunId && runPhase === 'automating') runPhase = 'ready';
     }, POLL_INTERVAL_MS);
   }
 
-  async function runAutomation(dialog, titleBox, descriptionBox, title, description, options) {
+  /** 사용자가 Studio의 "저장"을 누르면 이 실행을 '저장됨'으로 표시한다(재사용 가능 판단용). */
+  function watchForSave(dialog) {
+    if (saveWatchedDialogs.has(dialog)) return;
+    saveWatchedDialogs.add(dialog);
+    dialog.addEventListener(
+      'click',
+      (event) => {
+        if (event.target instanceof Element && event.target.closest(DONE_BUTTON_SELECTOR)) {
+          runPhase = 'saved';
+          console.log(`${LOG_TAG} 저장 클릭 감지`);
+        }
+      },
+      true
+    );
+  }
+
+  async function runAutomation(dialog, titleBox, descriptionBox) {
+    const options = currentOptions;
     const results = [];
     if (attachResult) results.push(attachResult);
     const report = () => setBannerMessage(formatResults(results, true));
 
     setBannerMessage(formatResults(results, false) + '\n제목/설명을 입력하는 중...');
     const [titleOk, descriptionOk] = await Promise.all([
-      fillWithVerify(titleBox, title),
-      fillWithVerify(descriptionBox, description),
+      fillWithVerify(titleBox, currentTitle),
+      fillWithVerify(descriptionBox, currentDescription),
     ]);
     results.push({ label: '제목', ok: titleOk });
     results.push({ label: '설명', ok: descriptionOk });
@@ -193,6 +410,7 @@
   // ---------------------------------------------------------------------------
 
   async function setupFolderAccess() {
+    folderLoaded = true;
     try {
       dirHandle = await loadDirHandle();
     } catch (error) {
@@ -213,7 +431,7 @@
 
   async function refreshFolderButton() {
     if (!folderButtonEl) return;
-    if (attachDone || (!forcePickFolder && (await hasReadPermission()))) {
+    if (fileNames.length === 0 || attachDone || (!forcePickFolder && (await hasReadPermission()))) {
       folderButtonEl.hidden = true;
       return;
     }
@@ -256,6 +474,7 @@
   /** 업로드 창의 파일 입력칸이 보이고 폴더 접근이 허용돼 있으면, 한 번만 파일을 넣어본다. */
   async function tryAttach() {
     if (attachStarted || attachDone || fileNames.length === 0 || automationStarted) return;
+    const runId = currentRunId;
 
     const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
     const input = dialog?.querySelector(FILE_INPUT_SELECTOR);
@@ -266,13 +485,14 @@
     attachStarted = true;
     setBannerMessage('다운로드 폴더에서 파일을 찾는 중...');
     attachResult = await safely('파일 첨부', () => attachFile(input));
+    if (runId !== currentRunId) return; // 그 사이 새 업로드로 재시작됨
 
     if (attachResult.ok) {
       attachDone = true;
       setBannerMessage(`✓ 파일 첨부 (${attachResult.detail})\nStudio가 파일을 받는 중...`);
       await refreshFolderButton();
       setTimeout(() => {
-        if (!automationStarted) {
+        if (runId === currentRunId && !automationStarted) {
           setBannerMessage('파일을 넣었지만 Studio가 반응하지 않았습니다. mp4를 직접 선택해주세요.', true);
         }
       }, ATTACH_REACTION_TIMEOUT_MS);
@@ -341,7 +561,10 @@
     const variants = new Set();
     for (const name of names) {
       variants.add(name);
-      variants.add(name.replace(/[<>:"/\\|?*]/g, '_'));
+      // 이 확장의 다운로드(background의 sanitizeFileName)와 Soop 공식 다운로드는 금지 문자를
+      // '-'로, Chrome 자체 치환은 '_'로 바꾸므로 둘 다 후보로 둔다.
+      variants.add(name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-'));
+      variants.add(name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_'));
     }
     return Array.from(variants).map((name) => {
       const dot = name.lastIndexOf('.');
@@ -596,7 +819,7 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  function showBanner(title, description) {
+  function showBanner() {
     if (document.getElementById(BANNER_HOST_ID)) return;
 
     const host = document.createElement('div');
@@ -624,7 +847,7 @@
       </style>
       <div class="banner">
         <div class="top"><strong>🎬 VOD 업로드 도우미</strong><button class="close" id="close" title="닫기">×</button></div>
-        <p class="message" id="message">업로드 창이 열리면 제목/설명과 설정해둔 옵션을 자동으로 채워드립니다. 다운로드 폴더를 연결해두면 mp4도 자동으로 첨부합니다.</p>
+        <p class="message" id="message"></p>
         <div class="actions">
           <button class="copy" id="copyTitle">제목 복사</button>
           <button class="copy" id="copyDescription">설명 복사</button>
@@ -636,14 +859,15 @@
     folderButtonEl = shadowRoot.getElementById('folderButton');
     folderButtonEl.addEventListener('click', onFolderButtonClick);
     shadowRoot.getElementById('close').addEventListener('click', () => host.remove());
-    bindCopyButton(shadowRoot.getElementById('copyTitle'), title, '제목 복사');
-    bindCopyButton(shadowRoot.getElementById('copyDescription'), description, '설명 복사');
+    // 같은 탭에서 새 업로드로 재시작되면 값이 바뀌므로, 클릭 시점의 현재 값을 복사한다.
+    bindCopyButton(shadowRoot.getElementById('copyTitle'), () => currentTitle, '제목 복사');
+    bindCopyButton(shadowRoot.getElementById('copyDescription'), () => currentDescription, '설명 복사');
   }
 
-  function bindCopyButton(button, text, label) {
+  function bindCopyButton(button, getText, label) {
     button.addEventListener('click', async () => {
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(getText());
         button.textContent = '복사됨!';
       } catch (error) {
         button.textContent = '복사 실패';

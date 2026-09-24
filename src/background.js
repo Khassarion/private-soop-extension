@@ -123,6 +123,82 @@ async function setPendingStudioUploads(pendingStudioUploads) {
   await chrome.storage.session.set({ pendingStudioUploads });
 }
 
+/** Studio 탭의 content script에 전달할 데이터(제목/설명/파일 후보/저장된 옵션)를 만든다. */
+async function buildStudioPayload(entry) {
+  const { vodFileInfo } = (await getSettings()).features;
+  return {
+    title: entry.title,
+    description: entry.description,
+    fileNames: entry.fileNames || [],
+    downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
+    options: {
+      visibility: vodFileInfo.youtubeVisibility,
+      notForKids: vodFileInfo.youtubeNotForKids,
+      playlists: vodFileInfo.youtubePlaylists,
+    },
+  };
+}
+
+/** 탭의 content script에 메시지를 보내되, 응답이 없거나 실패하면 null (멈춰버리지 않도록 타임아웃) */
+function sendToTab(tabId, message, timeoutMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    chrome.tabs
+      .sendMessage(tabId, message)
+      .then((response) => {
+        clearTimeout(timer);
+        resolve(response ?? null);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+  });
+}
+
+/**
+ * 우리가 열었던 Studio 탭 중 지금 업로드 창이 비어 있는(저장까지 끝난) 탭을 찾아, 그 탭에서
+ * 새 업로드를 시작시킨다. 성공하면 그 탭의 id를, 재사용할 탭이 없거나 실패하면 null을 반환한다
+ * (호출부가 새 탭을 여는 것으로 넘어간다). 진행 중이거나 저장 전인 업로드 창이 열린 탭은
+ * content script가 재사용 불가로 답하므로 절대 건드리지 않는다.
+ */
+async function tryReuseStudioTab(entry) {
+  const pending = await getPendingStudioUploads();
+  const payload = await buildStudioPayload(entry);
+  let pendingChanged = false;
+
+  for (const idText of Object.keys(pending)) {
+    const tabId = Number(idText);
+
+    let tab;
+    try {
+      tab = await chrome.tabs.get(tabId);
+    } catch (error) {
+      delete pending[idText]; // 이미 닫힌 탭
+      pendingChanged = true;
+      continue;
+    }
+
+    const probe = await sendToTab(tabId, { action: 'youtubeStudio:probe' }, 2000);
+    if (!probe?.reusable) continue;
+
+    const result = await sendToTab(tabId, { action: 'youtubeStudio:restart', payload }, 25000);
+    if (!result?.started) {
+      console.log(`${STUDIO_LOG_TAG} 탭 재사용 실패 (tabId=${tabId}): ${result?.reason || '응답 없음'}`);
+      continue;
+    }
+
+    pending[idText] = entry; // 탭이 새로고침돼도 최신 업로드 데이터로 이어지게 갱신
+    await setPendingStudioUploads(pending);
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    return tabId;
+  }
+
+  if (pendingChanged) await setPendingStudioUploads(pending);
+  return null;
+}
+
 /**
  * 다운로드 하위 폴더 설정을 안전한 상대 경로로 정리한다 ("..", 절대경로, 드라이브 문자 등 제거).
  * chrome.downloads의 filename은 Chrome 다운로드 폴더 기준 상대 경로만 허용한다.
@@ -133,6 +209,17 @@ function normalizeSubfolder(value) {
     .map((part) => part.trim().replace(/[<>:"|?*]/g, '_'))
     .filter((part) => part && part !== '.' && part !== '..')
     .join('/');
+}
+
+/**
+ * 파일 이름으로 쓸 수 없는 문자(Windows 금지 문자 + 제어 문자)를 하이픈으로 바꾼다. Soop 공식
+ * 다운로드도 같은 방식이라 이 규칙에 맞춰야 하고, 안 바꾸면 chrome.downloads가 "Invalid filename"
+ * 으로 실패하거나 Chrome이 임의로 바꿔 저장한다. 파일 이름 부분에만 쓴다(경로 구분자 포함).
+ * 업로드용 제목에는 쓰지 않는다 — 제목은 치환 전 원본 이름을 그대로 쓴다.
+ * (youtubeStudio.js의 buildNameMatchers가 같은 규칙으로 저장된 이름을 추정한다.)
+ */
+function sanitizeFileName(name) {
+  return String(name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-');
 }
 
 // 다운로드가 끝나면 브라우저가 실제로 저장한 파일 이름을 기록해둔다. 특수문자 치환이나
@@ -420,16 +507,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'youtubeStudio:open') {
     (async () => {
       try {
-        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
-        const pending = await getPendingStudioUploads();
-        pending[tab.id] = {
+        const entry = {
           title: request.title,
           description: request.description,
           fileNames: Array.isArray(request.fileNames) ? request.fileNames : [],
         };
+
+        // 이미 열려 있고 저장까지 끝난(놀고 있는) Studio 탭이 있으면 새 탭을 열지 않고
+        // 그 탭에서 "동영상 업로드"만 다시 눌러 새 업로드 데이터로 이어서 진행한다.
+        const reusedTabId = await tryReuseStudioTab(entry);
+        if (reusedTabId != null) {
+          console.log(`${STUDIO_LOG_TAG} 기존 Studio 탭 재사용 (tabId=${reusedTabId}), 제목: ${entry.title}`);
+          sendResponse({ success: true, reused: true });
+          return;
+        }
+
+        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
+        const pending = await getPendingStudioUploads();
+        pending[tab.id] = entry;
         await setPendingStudioUploads(pending);
         console.log(`${STUDIO_LOG_TAG} 업로드 탭 열림 (tabId=${tab.id}), 제목: ${request.title}`);
-        sendResponse({ success: true });
+        sendResponse({ success: true, reused: false });
       } catch (error) {
         console.error(`${STUDIO_LOG_TAG} 업로드 탭 열기 오류:`, error);
         sendResponse({ success: false, error: error.message });
@@ -447,20 +545,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ pending: false });
         return;
       }
-      const { vodFileInfo } = (await getSettings()).features;
       console.log(`${STUDIO_LOG_TAG} Studio 탭에 제목/설명/옵션 전달 (tabId=${tabId})`);
-      sendResponse({
-        pending: true,
-        title: entry.title,
-        description: entry.description,
-        fileNames: entry.fileNames || [],
-        downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
-        options: {
-          visibility: vodFileInfo.youtubeVisibility,
-          notForKids: vodFileInfo.youtubeNotForKids,
-          playlists: vodFileInfo.youtubePlaylists,
-        },
-      });
+      sendResponse({ pending: true, ...(await buildStudioPayload(entry)) });
     })();
     return true;
   }
@@ -470,7 +556,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       try {
         const { vodFileInfo } = (await getSettings()).features;
         const subfolder = normalizeSubfolder(vodFileInfo.downloadSubfolder);
-        const safeName = String(request.filename).replace(/[\\/]/g, '_');
+        const safeName = sanitizeFileName(request.filename);
         const downloadId = await chrome.downloads.download({
           url: request.url,
           filename: subfolder ? `${subfolder}/${safeName}` : safeName,
