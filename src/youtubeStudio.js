@@ -2,8 +2,10 @@
  * Content Script: YouTube Studio 업로드 창 자동 입력
  * VOD 페이지의 "유튜브에 업로드" 버튼이 background를 통해 이 탭에 맡겨둔 제목/설명/파일명과
  * 설정 페이지에 저장해둔 옵션(아동용 아님, 재생목록, 공개 범위)을, Studio 업로드 창에 자동으로
- * 입력/선택한다. 다운로드 폴더를 연결해두면 mp4 파일도 자동으로 첨부한다. 마지막 "저장"
- * 클릭은 사용자가 직접 한다.
+ * 입력/선택한다. 다운로드 폴더를 연결해두면 mp4 파일도 자동으로 첨부한다. 모든 항목이
+ * 성공적으로 채워지면 "저장" 버튼과, 그 뒤에 뜨는 완료/공유 팝업의 닫기 버튼까지 자동으로
+ * 누른다(완전 자동화 진행 중). 하나라도 실패하면 저장은 시도하지 않고 사용자가 직접
+ * 확인·저장하게 둔다.
  * 백그라운드가 직접 연 탭에서만 동작하며(youtubeStudio:init 응답이 pending일 때),
  * 사용자가 평소에 쓰는 Studio 탭에는 아무 영향이 없다.
  * 업로드 창이 비어 있는(저장까지 끝난) 탭은 새 업로드를 위해 재사용된다: background가
@@ -32,6 +34,8 @@
   const PLAYLIST_ROW_GRACE_MS = 3000; // 다 불러온 뒤에도 못 찾은 이름을 마지막으로 기다리는 시간
   // 파일을 input에 넣은 뒤 Studio가 상세 화면으로 넘어가지 않으면 반응하지 않은 것으로 본다.
   const ATTACH_REACTION_TIMEOUT_MS = 15000;
+  // 저장 버튼을 누른 뒤 완료/공유 화면의 닫기 버튼이 나타날 때까지 기다리는 최대 시간.
+  const SAVE_PROCESSING_TIMEOUT_MS = 20000;
 
   // 모든 자동 입력/선택은 반드시 "업로드 창" 안에서만 한다 — 이미 올라간 영상의 편집
   // 화면에도 같은 입력칸이 있어서, 범위를 제한하지 않으면 엉뚱한 영상을 건드릴 수 있다.
@@ -70,7 +74,13 @@
   const CREATE_BUTTON_SELECTORS = ['button[aria-label="만들기"]', 'button[aria-label="Create"]', '#create-icon'];
   const UPLOAD_MENU_ITEM_SELECTORS = ['tp-yt-paper-item#text-item-0', '#text-item-0'];
   const UPLOAD_MENU_ITEM_TEXTS = ['동영상 업로드', 'Upload videos', 'Upload video'];
-  const DIALOG_CLOSE_BUTTON_SELECTORS = ['#close-button', 'ytcp-button#close-button'];
+  // 실제 확인한 닫기 버튼은 id 없이 aria-label만 있는 순수 <button>이라 그것부터 찾는다.
+  const DIALOG_CLOSE_BUTTON_SELECTORS = [
+    'button[aria-label="닫기"]',
+    'button[aria-label="Close"]',
+    '#close-button',
+    'ytcp-button#close-button',
+  ];
   const DIALOG_CLOSE_BUTTON_TEXTS = ['닫기', 'Close'];
   const OPEN_DIALOG_TIMEOUT_MS = 8000;
   // 저장 후 업로드 창 대신(또는 뒤이어) 뜰 수 있는 "동영상 게시됨" 공유 창
@@ -322,7 +332,7 @@
       watchForSave(dialog);
       console.log(`${LOG_TAG} 업로드 창의 제목/설명 입력칸 발견, 자동 입력 시작`);
 
-      await runAutomation(dialog, titleBox, descriptionBox);
+      await runAutomation(dialog, titleBox, descriptionBox, runId);
       if (runId === currentRunId && runPhase === 'automating') runPhase = 'ready';
     }, POLL_INTERVAL_MS);
   }
@@ -343,7 +353,7 @@
     );
   }
 
-  async function runAutomation(dialog, titleBox, descriptionBox) {
+  async function runAutomation(dialog, titleBox, descriptionBox, runId) {
     const options = currentOptions;
     const results = [];
     if (attachResult) results.push(attachResult);
@@ -377,10 +387,76 @@
 
     const allOk = results.every((r) => r.ok);
     console.log(`${LOG_TAG} 자동 입력 결과`, results);
+
+    if (allOk) {
+      setBannerMessage(formatResults(results, true) + '\n모든 항목 입력 완료. 저장하는 중...');
+      await autoSaveAndClose(dialog, runId, results);
+    } else {
+      setBannerMessage(
+        formatResults(results, true) + '\n실패한 항목은 Studio에서 직접 설정해주세요.',
+        true
+      );
+    }
+  }
+
+  /**
+   * 모든 자동 입력이 성공했을 때만 호출된다. Studio의 "저장"(#done-button)을 직접 눌러
+   * 업로드를 마무리하고, 저장 후 뜨는 완료/공유 팝업의 닫기 버튼도 자동으로 누른다.
+   * 두 버튼 모두 실제 Studio 화면에서 확인한 값이 아니라 기존 코드에 있던 값을 그대로
+   * 쓴 것이라, 실패하면 배너/콘솔에 어느 단계인지 남기고 사용자가 직접 마무리하게 둔다
+   * (재시작으로 이 실행이 무효가 됐으면 runId 불일치로 중간에 멈춘다).
+   */
+  async function autoSaveAndClose(dialog, runId, results) {
+    const saveButton = dialog.querySelector(DONE_BUTTON_SELECTOR);
+    if (!saveButton) {
+      console.warn(`${LOG_TAG} 저장 버튼(${DONE_BUTTON_SELECTOR})을 찾지 못함`);
+      setBannerMessage(formatResults(results, true) + '\n저장 버튼을 찾지 못해 직접 눌러야 합니다.', true);
+      return;
+    }
+
+    console.log(`${LOG_TAG} 저장 버튼 자동 클릭`);
+    saveButton.click(); // watchForSave의 클릭 리스너가 이 클릭도 그대로 감지해 runPhase를 'saved'로 바꾼다
+
+    // 저장 처리 중엔 원래 업로드 창이 완료 화면으로 바뀌거나, 별도의 공유 창이 뜬다.
+    // 처리에 걸리는 시간이 일정하지 않아, 고정 대기 대신 닫기 버튼이 나타날 때까지 기다린다.
+    const closeButton = await waitFor(findSaveCompletionCloseButton, SAVE_PROCESSING_TIMEOUT_MS);
+    if (runId !== currentRunId) return; // 그 사이 새 업로드로 재시작됨
+
+    if (!closeButton) {
+      console.warn(`${LOG_TAG} 저장 후 완료 화면의 닫기 버튼을 찾지 못함`);
+      setBannerMessage(formatResults(results, true) + '\n저장은 됐지만 완료 화면을 찾지 못했습니다. 직접 닫아주세요.', true);
+      return;
+    }
+
+    console.log(`${LOG_TAG} 완료 화면 닫기 버튼 자동 클릭`);
+    closeButton.click();
+
+    // 팝업을 감싸는 컨테이너를 특정하지 않으므로, "닫기" 버튼 자체가 사라졌는지로 성공 여부를 본다.
+    const popupGone = await waitFor(() => !findSaveCompletionCloseButton(), STEP_WAIT_MS);
+    if (runId !== currentRunId) return;
+
     setBannerMessage(
-      formatResults(results, true) +
-        (allOk ? '\n업로드가 끝나면 Studio의 "저장"을 눌러주세요.' : '\n실패한 항목은 Studio에서 직접 설정해주세요.'),
-      !allOk
+      formatResults(results, true) + (popupGone ? '\n저장하고 팝업까지 자동으로 닫았습니다.' : '\n저장은 됐지만 팝업이 남아 있습니다. 직접 닫아주세요.'),
+      !popupGone
+    );
+  }
+
+  /**
+   * 저장 후 나타나는 완료/공유 화면의 닫기 버튼을 찾는다. 그 화면을 감싸는 요소가
+   * `ytcp-uploads-dialog`나 `ytcp-video-share-dialog`가 아닐 수도 있어(확인 안 된 추측),
+   * 특정 컨테이너 안으로 좁히지 않고 화면 전체에서 실제로 보이는 버튼을 찾는다 — "닫기"
+   * 버튼은 저장 직후 이 시점에만 나타나므로 범위를 넓혀도 엉뚱한 버튼을 누를 위험은 적다.
+   */
+  function findSaveCompletionCloseButton() {
+    return findVisible(document, DIALOG_CLOSE_BUTTON_SELECTORS) || findVisibleButtonByText(document, DIALOG_CLOSE_BUTTON_TEXTS);
+  }
+
+  function findVisibleButtonByText(root, texts) {
+    const wanted = texts.map(normalize);
+    return (
+      Array.from(root.querySelectorAll('ytcp-button, button')).find(
+        (btn) => isVisible(btn) && wanted.includes(normalize(btn.textContent))
+      ) || null
     );
   }
 
