@@ -59,7 +59,18 @@
         .file-status { margin-top: 4px; font-size: 11px; color: #6b7280; }
         .file-status.error { color: #dc2626; }
         .copy-all-button { width: 100%; margin-bottom: 10px; padding: 7px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; font-size: 12px; font-weight: 600; }
-        .copy-all-button:hover { background: #1d4ed8; }
+        .copy-all-button:hover:not(:disabled) { background: #1d4ed8; }
+        .copy-all-button:disabled { opacity: .6; cursor: not-allowed; }
+        .run-all-button { background: #16a34a; }
+        .run-all-button:hover:not(:disabled) { background: #15803d; }
+        .stop-all-button { background: #dc2626; }
+        .stop-all-button:hover:not(:disabled) { background: #b91c1c; }
+        .stop-all-button[hidden] { display: none; }
+        .storage-info { font-size: 11px; color: #6b7280; margin: -4px 0 10px; word-break: break-all; }
+        .storage-info:empty { display: none; }
+        .batch-status { margin: -4px 0 10px; font-size: 11px; color: #6b7280; }
+        .batch-status:empty { display: none; }
+        .batch-status.error { color: #dc2626; }
         .message { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0; }
         .message.error { color: #dc2626; }
       </style>
@@ -128,7 +139,12 @@
     }
 
     const vodUrl = `https://vod.sooplive.com/player/${videoId}`;
-    const metas = files.map((file, index) => buildFileMeta(file, index, vodUrl, files.length));
+    // 제목/라벨의 날짜는 파일별 시작 날짜가 아니라 이 다시보기 "첫 파일"의 시작 날짜로 통일한다.
+    // 자정을 넘겨 이어진 방송은 뒤쪽 파일이 다음 날 새벽에 시작해서, 파일별 날짜를 쓰면
+    // "14일 (1/3), 14일 (2/3), 15일 (3/3)"처럼 같은 방송이 다른 날짜로 올라가 헷갈린다.
+    const firstFile = files.reduce((a, b) => (Number(b.file_order) < Number(a.file_order) ? b : a));
+    const labelDate = new Date(firstFile.file_start);
+    const metas = files.map((file, index) => buildFileMeta(file, index, vodUrl, files.length, labelDate));
     const getDownloadFileList = createDownloadFileListLoader(videoId);
 
     contentEl.innerHTML = '';
@@ -137,6 +153,11 @@
     summary.className = 'vod-summary';
     summary.textContent = `${data.bj_id ? `BJ: ${data.bj_id} · ` : ''}총 ${metas.length}개 파일`;
     contentEl.appendChild(summary);
+
+    const storageInfo = document.createElement('div');
+    storageInfo.className = 'storage-info';
+    contentEl.appendChild(storageInfo);
+    showStorageOverview(storageInfo);
 
     const copyAllButton = document.createElement('button');
     copyAllButton.className = 'copy-all-button';
@@ -147,8 +168,24 @@
     });
     contentEl.appendChild(copyAllButton);
 
+    const runAllButton = document.createElement('button');
+    runAllButton.className = 'copy-all-button run-all-button';
+    runAllButton.textContent = '모두 다운로드&업로드';
+    contentEl.appendChild(runAllButton);
+
+    const stopButton = document.createElement('button');
+    stopButton.className = 'copy-all-button stop-all-button';
+    stopButton.textContent = '배치 중단';
+    stopButton.hidden = true; // 배치가 도는 동안에만 보인다
+    contentEl.appendChild(stopButton);
+
+    const batchStatus = document.createElement('div');
+    batchStatus.className = 'batch-status';
+    contentEl.appendChild(batchStatus);
+
     const list = document.createElement('ul');
     list.className = 'file-list';
+    const fileControls = [];
 
     metas.forEach((meta) => {
       const item = document.createElement('li');
@@ -188,13 +225,156 @@
       setupUploadUI(item, meta, videoId, getDownloadFileList);
       setupDownloadUI(item, meta, videoId, getDownloadFileList);
 
+      fileControls.push({
+        downloadButton: item.querySelector('.download-button'),
+        uploadButton: item.querySelector('.upload-button'),
+        statusEl: item.querySelector('.file-status'),
+      });
+
       list.appendChild(item);
     });
 
     contentEl.appendChild(list);
+
+    runAllButton.addEventListener('click', () =>
+      runDownloadUploadAll(metas, videoId, getDownloadFileList, fileControls, runAllButton, stopButton, batchStatus)
+    );
   }
 
-  function buildFileMeta(file, index, vodUrl, totalCount) {
+  /**
+   * "모두 다운로드&업로드": 파일을 하나씩 순서대로 다운로드하고, 다운로드가 실제로 끝난 것을
+   * 확인한 뒤에야 그 파일의 업로드(Studio 탭 열기/재사용)를 시작하고 바로 다음 파일 다운로드로
+   * 넘어간다. 업로드 자체(Studio에서의 자동 입력·저장)가 끝나길 기다리지는 않는다 — 그건 별도
+   * 탭에서 진행되며, 다음 파일을 내려받는 동안 백그라운드로 계속된다. 실패한 파일이 있어도
+   * 배치 전체를 멈추지 않고 다음 파일로 넘어간다.
+   * "배치 중단"을 누르면 진행 중이던 다운로드를 취소하고 남은 파일은 처리하지 않는다. 이미
+   * 시작된 업로드(Studio 탭)는 되돌리지 않는다.
+   */
+  async function runDownloadUploadAll(
+    metas,
+    videoId,
+    getDownloadFileList,
+    fileControls,
+    runAllButton,
+    stopButton,
+    batchStatus
+  ) {
+    let cancelled = false;
+    const shouldCancel = () => cancelled;
+    stopButton.hidden = false;
+    stopButton.disabled = false;
+    stopButton.textContent = '배치 중단';
+    stopButton.onclick = () => {
+      cancelled = true;
+      stopButton.disabled = true;
+      stopButton.textContent = '중단하는 중...';
+    };
+
+    const originalLabel = runAllButton.textContent;
+    runAllButton.disabled = true;
+    fileControls.forEach(({ downloadButton, uploadButton }) => {
+      downloadButton.disabled = true;
+      uploadButton.disabled = true;
+    });
+    batchStatus.textContent = '';
+    batchStatus.classList.remove('error');
+
+    let successCount = 0;
+    let failCount = 0;
+    let processed = 0; // 중단 시 "처리하지 않은 파일" 개수 계산용
+
+    for (let i = 0; i < metas.length; i += 1) {
+      if (cancelled) break;
+      const meta = metas[i];
+      const { statusEl } = fileControls[i];
+      runAllButton.textContent = `${originalLabel} (${i + 1}/${metas.length} 진행 중)`;
+      processed = i + 1;
+
+      const downloadResult = await downloadFile(meta, videoId, getDownloadFileList, (text, isError) =>
+        setStatus(statusEl, text, isError)
+      );
+      if (!downloadResult.ok) {
+        failCount += 1;
+        continue;
+      }
+      if (cancelled) {
+        await cancelDownload(downloadResult.downloadId);
+        setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
+        break;
+      }
+
+      setStatus(statusEl, '다운로드 완료 확인 중...', false);
+      const outcome = await waitForDownloadOutcome(downloadResult.downloadId, DOWNLOAD_WAIT_TIMEOUT_MS, shouldCancel);
+      if (outcome?.cancelled) {
+        await cancelDownload(downloadResult.downloadId);
+        setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
+        break;
+      }
+      if (!outcome?.ok) {
+        setStatus(statusEl, `다운로드 실패: ${outcome?.error || '완료 확인 시간 초과'}`, true);
+        failCount += 1;
+        continue;
+      }
+
+      const uploadResult = await uploadFile(meta, videoId, getDownloadFileList, (text, isError) =>
+        setStatus(statusEl, text, isError)
+      );
+      if (uploadResult.ok) successCount += 1;
+      else failCount += 1;
+    }
+
+    runAllButton.textContent = originalLabel;
+    runAllButton.disabled = false;
+    fileControls.forEach(({ downloadButton, uploadButton }) => {
+      downloadButton.disabled = false;
+      uploadButton.disabled = false;
+    });
+
+    stopButton.hidden = true;
+    stopButton.onclick = null;
+
+    if (cancelled) {
+      const untouched = metas.length - processed;
+      batchStatus.textContent =
+        `중단됨: 업로드 시작 성공 ${successCount}개, 실패 ${failCount}개` +
+        (untouched > 0 ? `, 처리하지 않은 파일 ${untouched}개` : '');
+      batchStatus.classList.add('error');
+    } else {
+      batchStatus.textContent = `완료: 업로드 시작 성공 ${successCount}개, 실패 ${failCount}개`;
+      batchStatus.classList.toggle('error', failCount > 0);
+    }
+    console.log(
+      `[VodFileInfo] 모두 다운로드&업로드 ${cancelled ? '중단' : '완료'}: 성공 ${successCount} / 실패 ${failCount}`
+    );
+  }
+
+  function setStatus(statusEl, text, isError = false) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle('error', isError);
+  }
+
+  /** 디스크별 전체 용량과 확장이 받은 파일의 합계를 보여준다(남은 용량은 Chrome이 제공하지 않음). */
+  async function showStorageOverview(el) {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'storage:overview' });
+      if (!response?.success) return;
+      const { disks, files } = response.data;
+      const diskText = disks.length > 0 ? disks.map((d) => formatBytes(d.capacity)).join(' / ') : '확인 불가';
+      el.textContent =
+        `디스크 전체 용량: ${diskText} (남은 용량은 Chrome이 제공하지 않음) · ` +
+        `받은 파일 ${files.count}개, ${formatBytes(files.bytes)}`;
+    } catch (_error) {
+      // 표시 전용이라 실패해도 무시
+    }
+  }
+
+  function formatBytes(bytes) {
+    const gb = bytes / 1024 ** 3;
+    if (gb >= 1) return `${gb >= 100 ? Math.round(gb) : gb.toFixed(1)}GB`;
+    return `${Math.round(bytes / 1024 ** 2)}MB`;
+  }
+
+  function buildFileMeta(file, index, vodUrl, totalCount, labelDate) {
     const start = new Date(file.file_start);
     const durationMs = Number(file.duration) || 0;
     const end = new Date(start.getTime() + durationMs);
@@ -204,7 +384,7 @@
     const durationText = formatDuration(durationMs);
     const chatUrl = file.chat || null;
 
-    const dateLabel = formatKoreanDate(start);
+    const dateLabel = formatKoreanDate(labelDate || start); // 방송 시간 텍스트는 파일별 실제 시각 그대로
     const label = totalCount > 1
       ? `${dateLabel} (${index + 1}/${totalCount})`
       : dateLabel;
@@ -273,64 +453,71 @@
     return div.innerHTML;
   }
 
-  /**
-   * "유튜브에 업로드" 버튼: YouTube Studio 업로드 창을 새 탭으로 열면서, 이 파일의
-   * 제목/설명을 background에 맡겨둔다. Studio 탭에 붙는 youtubeStudio.js가 업로드 창에서
-   * 사용자가 mp4를 고르면 그 값을 제목/설명 칸에 자동으로 채워준다.
-   * (파일 자체는 브라우저가 로컬 경로 접근을 막고 확장 메시징으로 큰 바이너리를 옮길 수도
-   * 없어서, Studio의 "파일 선택"에서 사용자가 직접 고르는 단계가 남는다.)
-   */
+  /** "유튜브에 업로드" 버튼: 실제 동작은 uploadFile()이 하고, 여기서는 버튼만 연결한다. */
   function setupUploadUI(item, meta, videoId, getDownloadFileList) {
     const uploadButton = item.querySelector('.upload-button');
     const statusEl = item.querySelector('.file-status');
 
     uploadButton.addEventListener('click', async () => {
       uploadButton.disabled = true;
-      statusEl.classList.remove('error');
-      statusEl.textContent = '업로드 창을 여는 중...';
-
-      try {
-        // 다운로드용 파일 목록에서 원본 방송 제목을 얻을 수 있으면 뒤에 붙이고,
-        // 못 얻으면(로그인 문제 등) 대괄호 부분만으로 진행한다.
-        let title = `[${meta.label}]`;
-        // Studio 업로드 창에 자동 첨부할 파일의 후보 이름: 우리 다운로드 버튼으로 받았을 때
-        // 기록해둔 실제 저장 이름(브라우저가 바꿨을 수 있음) + Soop이 알려준 원래 파일명.
-        const fileNames = [];
-        try {
-          const fileList = await getDownloadFileList();
-          const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
-          const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
-          if (contentTitle) title = `${title} ${contentTitle}`;
-
-          if (entry) {
-            const { downloadedFiles } = await chrome.storage.local.get(['downloadedFiles']);
-            const savedName = downloadedFiles?.[downloadRecordKey(videoId, entry.file_order)]?.name;
-            if (savedName) fileNames.push(savedName);
-            if (entry.file_name && !fileNames.includes(entry.file_name)) fileNames.push(entry.file_name);
-          }
-        } catch (_error) {
-          // 대괄호만 있는 제목 유지, 파일 자동 첨부는 건너뛴다(직접 선택)
-        }
-
-        const response = await chrome.runtime.sendMessage({
-          action: 'youtubeStudio:open',
-          title,
-          description: meta.descriptionText,
-          fileNames,
-        });
-        if (!response?.success) {
-          throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
-        }
-        statusEl.textContent = response.reused
-          ? '열려 있는 Studio 탭에서 새 업로드를 시작했습니다. 파일이 자동으로 첨부되지 않으면 mp4를 직접 선택하세요.'
-          : 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.';
-      } catch (error) {
-        statusEl.textContent = `업로드 창 열기 실패: ${error.message}`;
-        statusEl.classList.add('error');
-      } finally {
-        uploadButton.disabled = false;
-      }
+      await uploadFile(meta, videoId, getDownloadFileList, (text, isError) => setStatus(statusEl, text, isError));
+      uploadButton.disabled = false;
     });
+  }
+
+  /**
+   * "유튜브에 업로드" 버튼(및 "모두 다운로드&업로드" 배치)이 공유하는 실제 로직: YouTube
+   * Studio 업로드 창을 새 탭으로 열거나 idle한 기존 탭을 재사용하면서, 이 파일의 제목/설명을
+   * background에 맡겨둔다. Studio 탭에 붙는 youtubeStudio.js가 업로드 창에서 파일이
+   * 첨부되면 그 값을 제목/설명 칸에 자동으로 채워준다. 이 함수는 업로드 창을 "여는 것"까지만
+   * 책임지며, Studio 안에서의 자동 입력·저장이 끝나는 것을 기다리지 않는다.
+   */
+  async function uploadFile(meta, videoId, getDownloadFileList, onStatus) {
+    onStatus('업로드 창을 여는 중...', false);
+
+    try {
+      // 다운로드용 파일 목록에서 원본 방송 제목을 얻을 수 있으면 뒤에 붙이고,
+      // 못 얻으면(로그인 문제 등) 대괄호 부분만으로 진행한다.
+      let title = `[${meta.label}]`;
+      // Studio 업로드 창에 자동 첨부할 파일의 후보 이름: 우리 다운로드 버튼으로 받았을 때
+      // 기록해둔 실제 저장 이름(브라우저가 바꿨을 수 있음) + Soop이 알려준 원래 파일명.
+      const fileNames = [];
+      try {
+        const fileList = await getDownloadFileList();
+        const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
+        const contentTitle = entry ? deriveContentTitle(entry.file_name) : '';
+        if (contentTitle) title = `${title} ${contentTitle}`;
+
+        if (entry) {
+          const { downloadedFiles } = await chrome.storage.local.get(['downloadedFiles']);
+          const savedName = downloadedFiles?.[downloadRecordKey(videoId, entry.file_order)]?.name;
+          if (savedName) fileNames.push(savedName);
+          if (entry.file_name && !fileNames.includes(entry.file_name)) fileNames.push(entry.file_name);
+        }
+      } catch (_error) {
+        // 대괄호만 있는 제목 유지, 파일 자동 첨부는 건너뛴다(직접 선택)
+      }
+
+      const response = await chrome.runtime.sendMessage({
+        action: 'youtubeStudio:open',
+        title,
+        description: meta.descriptionText,
+        fileNames,
+      });
+      if (!response?.success) {
+        throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
+      }
+      onStatus(
+        response.reused
+          ? '열려 있는 Studio 탭에서 새 업로드를 시작했습니다. 파일이 자동으로 첨부되지 않으면 mp4를 직접 선택하세요.'
+          : 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.',
+        false
+      );
+      return { ok: true, reused: response.reused };
+    } catch (error) {
+      onStatus(`업로드 창 열기 실패: ${error.message}`, true);
+      return { ok: false, error: error.message };
+    }
   }
 
   /**
@@ -414,6 +601,7 @@
     return `${videoId}:${Number(fileOrder)}`;
   }
 
+  /** 다운로드를 시작하고 chrome.downloads의 downloadId를 돌려준다(완료 확인에 쓰인다). */
   async function startBrowserDownload(url, filename, record) {
     const response = await chrome.runtime.sendMessage({
       action: 'download:start',
@@ -425,6 +613,47 @@
     if (!response?.success) {
       throw new Error(response?.error || '다운로드를 시작하지 못했습니다.');
     }
+    return response.downloadId;
+  }
+
+  // 배치가 한 파일의 다운로드가 끝나길 기다리는 방식: background가 완료/중단 시 기록하는
+  // downloadOutcomes[downloadId]를 폴링한다. 서비스 워커가 다운로드 도중 죽어도 storage는
+  // 남아 있으므로 메시지 채널을 오래 열어두는 방식보다 안정적이다. 대용량 VOD와 느린 회선을
+  // 고려해 넉넉하게 기다린다.
+  const DOWNLOAD_OUTCOME_POLL_MS = 1000;
+  const DOWNLOAD_WAIT_TIMEOUT_MS = 3 * 60 * 60 * 1000;
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** 진행 중인 다운로드를 취소한다(background가 chrome.downloads.cancel 호출). 실패해도 무시. */
+  async function cancelDownload(downloadId) {
+    try {
+      await chrome.runtime.sendMessage({ action: 'download:cancel', downloadId });
+    } catch (_error) {
+      // 이미 끝났거나 확장 컨텍스트 문제 — 중단 자체는 계속 진행한다
+    }
+  }
+
+  /**
+   * shouldCancel()이 true가 되면 기다림을 멈추고 { cancelled: true }를 돌려준다(배치 중단용).
+   * 시간 초과면 null.
+   */
+  async function waitForDownloadOutcome(downloadId, timeoutMs, shouldCancel = () => false) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (shouldCancel()) return { ok: false, cancelled: true };
+      const { downloadOutcomes = {} } = await chrome.storage.local.get(['downloadOutcomes']);
+      const outcome = downloadOutcomes[downloadId];
+      if (outcome) {
+        delete downloadOutcomes[downloadId];
+        await chrome.storage.local.set({ downloadOutcomes });
+        return outcome;
+      }
+      await sleep(DOWNLOAD_OUTCOME_POLL_MS);
+    }
+    return null; // 시간 초과
   }
 
   function setupDownloadUI(item, meta, videoId, getDownloadFileList) {
@@ -433,29 +662,40 @@
 
     downloadButton.addEventListener('click', async () => {
       downloadButton.disabled = true;
-      statusEl.classList.remove('error');
-      statusEl.textContent = '다운로드 정보 조회 중...';
-
-      try {
-        const fileList = await getDownloadFileList();
-        const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
-        if (!entry) throw new Error('다운로드 가능한 파일 정보를 찾을 수 없습니다.');
-
-        const quality = entry.file_low?.[0];
-        if (!quality) throw new Error('다운로드 화질 정보를 찾을 수 없습니다.');
-
-        statusEl.textContent = '다운로드 주소 요청 중...';
-        const downUrl = await requestDownloadUrl(videoId, entry.file_order, quality.name, entry.file_name);
-
-        statusEl.textContent = '다운로드 시작...';
-        await startBrowserDownload(downUrl, entry.file_name, { videoId, fileOrder: Number(entry.file_order) });
-        statusEl.textContent = '다운로드가 시작되었습니다 (브라우저 다운로드 목록 확인).';
-      } catch (error) {
-        statusEl.textContent = `다운로드 실패: ${error.message}`;
-        statusEl.classList.add('error');
-      } finally {
-        downloadButton.disabled = false;
-      }
+      await downloadFile(meta, videoId, getDownloadFileList, (text, isError) => setStatus(statusEl, text, isError));
+      downloadButton.disabled = false;
     });
+  }
+
+  /**
+   * "다운로드" 버튼(및 "모두 다운로드&업로드" 배치)이 공유하는 실제 로직. 다운로드를 "시작"하는
+   * 것까지만 책임지고, 완료를 기다리려면 성공 시 돌려주는 downloadId로 waitForDownloadOutcome을
+   * 쓴다.
+   */
+  async function downloadFile(meta, videoId, getDownloadFileList, onStatus) {
+    onStatus('다운로드 정보 조회 중...', false);
+
+    try {
+      const fileList = await getDownloadFileList();
+      const entry = fileList.find((f) => Number(f.file_order) === meta.fileOrder);
+      if (!entry) throw new Error('다운로드 가능한 파일 정보를 찾을 수 없습니다.');
+
+      const quality = entry.file_low?.[0];
+      if (!quality) throw new Error('다운로드 화질 정보를 찾을 수 없습니다.');
+
+      onStatus('다운로드 주소 요청 중...', false);
+      const downUrl = await requestDownloadUrl(videoId, entry.file_order, quality.name, entry.file_name);
+
+      onStatus('다운로드 시작...', false);
+      const downloadId = await startBrowserDownload(downUrl, entry.file_name, {
+        videoId,
+        fileOrder: Number(entry.file_order),
+      });
+      onStatus('다운로드가 시작되었습니다 (브라우저 다운로드 목록 확인).', false);
+      return { ok: true, downloadId, entry };
+    } catch (error) {
+      onStatus(`다운로드 실패: ${error.message}`, true);
+      return { ok: false, error: error.message };
+    }
   }
 })();

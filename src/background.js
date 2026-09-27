@@ -4,6 +4,7 @@
  */
 
 import { isStreamerLive, getLoginId, getMissionStatus, getSoopVodInfo } from './soopLiveApi.js';
+import { indexYoutubeUploads, matchVodFiles } from './youtubeMatch.js';
 
 const LOG_TAG = '[LiveMonitor]';
 const LIVE_CHECK_ALARM_NAME = 'liveCheck';
@@ -139,6 +140,32 @@ async function buildStudioPayload(entry) {
   };
 }
 
+/** 유튜브 Studio 탭을 통해 내 채널의 업로드 영상 목록을 가져온다. 열린 Studio 탭이 없으면 잠깐 열었다 닫는다. */
+async function fetchYoutubeVideos() {
+  const existing = await chrome.tabs.query({ url: 'https://studio.youtube.com/*' });
+  let tabId = existing.find((t) => /\/channel\/UC/.test(t.url || ''))?.id ?? existing[0]?.id;
+  let createdTabId = null;
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({ url: 'https://studio.youtube.com/', active: false });
+    tabId = createdTabId = tab.id;
+  }
+
+  try {
+    // 새로 연 탭은 content script/채널 페이지 리다이렉트가 준비될 때까지 몇 번 다시 시도한다.
+    let lastError = '응답 없음';
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const res = await sendToTab(tabId, { action: 'youtubeVideos:list' }, 60000);
+      if (res?.success) return res.videos;
+      lastError = res?.error || '응답 없음';
+      if (res && !String(res.error).startsWith('NO_CHANNEL')) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`유튜브 영상 목록을 가져오지 못했습니다: ${lastError}`);
+  } finally {
+    if (createdTabId != null) chrome.tabs.remove(createdTabId).catch(() => {});
+  }
+}
+
 /** 탭의 content script에 메시지를 보내되, 응답이 없거나 실패하면 null (멈춰버리지 않도록 타임아웃) */
 function sendToTab(tabId, message, timeoutMs) {
   return new Promise((resolve) => {
@@ -232,27 +259,80 @@ async function trackDownload(downloadId, videoId, fileOrder) {
   await chrome.storage.local.set({ pendingDownloads });
 }
 
+// "모두 다운로드&업로드" 배치가 특정 다운로드의 완료(성공/실패)를 확인하려고 기다리는 곳.
+// downloadId별로 짧게 살다 사라지는 값이라 서비스 워커 메모리가 아니라 chrome.storage.local에
+// 두고, content script(vodFileInfo.js)가 직접 폴링해서 읽은 뒤 지운다. 배치를 쓰지 않는 평소
+// 수동 다운로드는 이 값을 아무도 읽지 않으므로, 여기서 오래된 항목을 그때그때 정리한다.
+const DOWNLOAD_OUTCOME_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function pruneOldDownloadOutcomes(downloadOutcomes) {
+  const cutoff = Date.now() - DOWNLOAD_OUTCOME_MAX_AGE_MS;
+  for (const [id, outcome] of Object.entries(downloadOutcomes)) {
+    if (!outcome.recordedAt || outcome.recordedAt < cutoff) delete downloadOutcomes[id];
+  }
+}
+
+/**
+ * 패널에 보여줄 저장 공간 정보. Chrome은 디스크 "남은 용량"을 주지 않아(getAvailableCapacity가
+ * 정식 버전에 없음) 디스크별 전체 용량과, 이 확장이 받아서 지금도 남아 있는 파일의 개수·합계
+ * 크기만 돌려준다. 디스크 이름은 NUL로 채워져 오므로 쓰지 않는다.
+ */
+async function getStorageOverview() {
+  const disks = await new Promise((resolve) => {
+    try {
+      chrome.system.storage.getInfo((units) => resolve(chrome.runtime.lastError ? [] : units || []));
+    } catch (error) {
+      resolve([]);
+    }
+  });
+
+  const { vodFileInfo } = (await getSettings()).features;
+  const subfolder = normalizeSubfolder(vodFileInfo.downloadSubfolder);
+  const { downloadedFiles = {} } = await chrome.storage.local.get(['downloadedFiles']);
+  const knownNames = new Set(Object.values(downloadedFiles).map((f) => f.name));
+
+  const items = await chrome.downloads.search({ state: 'complete', exists: true, limit: 0 });
+  const mine = items.filter((item) => {
+    const path = String(item.filename || '').replace(/\\/g, '/');
+    const name = path.split('/').pop();
+    if (!knownNames.has(name)) return false;
+    return !subfolder || path.includes(`/${subfolder}/`);
+  });
+
+  return {
+    disks: disks.map((d) => ({ type: d.type, capacity: d.capacity })),
+    files: { count: mine.length, bytes: mine.reduce((sum, item) => sum + Math.max(item.fileSize || 0, 0), 0) },
+  };
+}
+
 chrome.downloads.onChanged.addListener(async (delta) => {
   const state = delta.state?.current;
   if (state !== 'complete' && state !== 'interrupted') return;
 
-  const { pendingDownloads = {}, downloadedFiles = {} } = await chrome.storage.local.get([
+  const { pendingDownloads = {}, downloadedFiles = {}, downloadOutcomes = {} } = await chrome.storage.local.get([
     'pendingDownloads',
     'downloadedFiles',
+    'downloadOutcomes',
   ]);
   const tracked = pendingDownloads[delta.id];
   if (!tracked) return;
   delete pendingDownloads[delta.id];
+  pruneOldDownloadOutcomes(downloadOutcomes);
 
   if (state === 'complete') {
     const [item] = await chrome.downloads.search({ id: delta.id });
     if (item?.filename) {
       const name = item.filename.split(/[\\/]/).pop();
       downloadedFiles[`${tracked.videoId}:${tracked.fileOrder}`] = { name, savedAt: Date.now() };
+      downloadOutcomes[delta.id] = { ok: true, name, recordedAt: Date.now() };
       console.log(`${STUDIO_LOG_TAG} 다운로드 완료 기록: ${tracked.videoId}:${tracked.fileOrder} → ${name}`);
+    } else {
+      downloadOutcomes[delta.id] = { ok: false, error: '저장된 파일 정보를 찾지 못함', recordedAt: Date.now() };
     }
+  } else {
+    downloadOutcomes[delta.id] = { ok: false, error: delta.error?.current || '다운로드 중단됨', recordedAt: Date.now() };
   }
-  await chrome.storage.local.set({ pendingDownloads, downloadedFiles });
+  await chrome.storage.local.set({ pendingDownloads, downloadedFiles, downloadOutcomes });
 });
 
 /**
@@ -548,6 +628,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       console.log(`${STUDIO_LOG_TAG} Studio 탭에 제목/설명/옵션 전달 (tabId=${tabId})`);
       sendResponse({ pending: true, ...(await buildStudioPayload(entry)) });
     })();
+    return true;
+  }
+
+  // 목록 페이지에서 넘어온 VOD 아이디들을, 실제 유튜브 업로드 영상(설명의 Soop 링크 + 제목의 (n/max))과
+  // 대조해 파일별 업로드 여부와 유튜브 링크를 돌려준다.
+  if (request.action === 'vodUpload:match') {
+    (async () => {
+      try {
+        const videoIds = Array.isArray(request.videoIds) ? request.videoIds.map(String) : [];
+        const youtubeVideos = await fetchYoutubeVideos();
+        const index = indexYoutubeUploads(youtubeVideos);
+        const vods = [];
+        for (const videoId of videoIds) {
+          const data = await getSoopVodInfo(videoId).catch(() => null);
+          if (!data || !Array.isArray(data.files)) {
+            vods.push({ videoId, error: 'VOD 정보 조회 실패' });
+            continue;
+          }
+          vods.push(matchVodFiles(videoId, data.files, index));
+        }
+        sendResponse({ success: true, vods, youtubeVideoCount: youtubeVideos.length });
+      } catch (error) {
+        console.error('[vodUpload] 유튜브 매칭 오류:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
+  if (request.action === 'download:cancel') {
+    chrome.downloads
+      .cancel(Number(request.downloadId))
+      .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'storage:overview') {
+    getStorageOverview()
+      .then((data) => sendResponse({ success: true, data }))
+      .catch((error) => sendResponse({ success: false, error: error.message }));
     return true;
   }
 

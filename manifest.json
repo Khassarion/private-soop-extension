@@ -7,7 +7,8 @@
     "storage",
     "alarms",
     "activeTab",
-    "downloads"
+    "downloads",
+    "system.storage"
   ],
   "host_permissions": [
     "https://www.googleapis.com/*",
@@ -56,6 +57,16 @@
     {
       "matches": ["https://vod.sooplive.com/*"],
       "js": ["src/vodFileInfo.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.sooplive.com/station/*"],
+      "js": ["src/vodList.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://studio.youtube.com/*"],
+      "js": ["src/youtubeVideos.js"],
       "run_at": "document_idle"
     },
     {
