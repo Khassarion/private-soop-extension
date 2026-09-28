@@ -7,6 +7,9 @@
 
 (() => {
   const HOST_ID = 'private-extension-vod-file-info-host';
+  const LOG_TAG = '[VodFileInfo]';
+  // 지금 로드된 게 최신 버전인지 콘솔에서 바로 확인할 수 있도록 매번 찍는다.
+  console.log(`${LOG_TAG} v${chrome.runtime.getManifest().version} 로드됨`);
 
   chrome.storage.local.get(['settings']).then(({ settings }) => {
     if (settings?.features?.vodFileInfo?.enabled === false) return;
@@ -503,14 +506,18 @@
         title,
         description: meta.descriptionText,
         fileNames,
+        // "업로드 확인 후 자동 삭제"가 정확히 어느 로컬 파일을 지칭하는지 알 수 있도록 전달한다.
+        // 실제로 그 파일이 자동 첨부됐을 때만(youtubeStudio.js 쪽에서) 삭제를 시도하게 된다.
+        videoId,
+        fileOrder: meta.fileOrder,
       });
       if (!response?.success) {
-        throw new Error(response?.error || '업로드 창을 열지 못했습니다.');
+        throw new Error(response?.error || '업로드 요청을 보내지 못했습니다.');
       }
+      // Studio 탭은 하나만 두고 재사용하며, 순서대로 처리되도록 background의 대기열에 맡긴다
+      // (탭이 바로 준비돼 있으면 거의 즉시, 아니면 이전 업로드가 끝나는 대로 시작된다).
       onStatus(
-        response.reused
-          ? '열려 있는 Studio 탭에서 새 업로드를 시작했습니다. 파일이 자동으로 첨부되지 않으면 mp4를 직접 선택하세요.'
-          : 'Studio 업로드 창을 열었습니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부되고, 아니면 mp4를 직접 선택하세요.',
+        '업로드 대기열에 추가했습니다. Studio 탭이 준비되는 대로 자동으로 시작됩니다. 다운로드 폴더를 연결해두면 파일도 자동으로 첨부됩니다.',
         false
       );
       return { ok: true, reused: response.reused };

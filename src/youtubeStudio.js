@@ -19,6 +19,8 @@
 
 (() => {
   const LOG_TAG = '[YoutubeStudio]';
+  // 지금 로드된 게 최신 버전인지 콘솔에서 바로 확인할 수 있도록 매번 찍는다.
+  console.log(`${LOG_TAG} v${chrome.runtime.getManifest().version} 로드됨`);
   const BANNER_HOST_ID = 'private-extension-youtube-studio-banner';
 
   const POLL_INTERVAL_MS = 500;
@@ -92,7 +94,35 @@
   const DB_STORE = 'handles';
   const DIR_HANDLE_KEY = 'downloadDir';
 
-  const DEFAULT_OPTIONS = { visibility: 'unlisted', notForKids: true, playlists: [] };
+  const DEFAULT_OPTIONS = { visibility: 'unlisted', notForKids: true, playlists: [], deleteAfterUpload: false };
+
+  // ---------------------------------------------------------------------------
+  // 업로드(파일 전송) 완료 감지 — "업로드 확인 후 로컬 파일 자동 삭제" 기능용.
+  // Studio의 동영상 목록(콘텐츠 페이지, 업로드 창이 열려 있는 동안에도 그 밑에 같이 렌더링돼
+  // 있다)에서 이 업로드의 제목과 정확히 일치하는 행을 찾은 뒤, 그 행의 "공개 상태" 칸에
+  // 설정한 공개범위 라벨(예: "일부 공개")이 실제로 표시되는지를 본다. 그 뒤의 HD 변환/검토
+  // 같은 유튜브 서버 쪽 처리는 로컬 파일과 무관하므로 이 시점에 지워도 된다. 공개 상태 칸의
+  // 마크업(.tablecell-visibility)은 실제 화면에서 확인했다.
+  // 행을 찾을 때 처음엔 <ytcp-video-upload-progress uploading> 배지(업로드 취소 버튼)가
+  // 떠 있어야만 인정했었는데, 업로드가 폴링 간격(2초)보다 빨리 끝나버리면 그 배지가 뜬
+  // 순간을 놓쳐 영영 못 찾는 문제가 실제로 있었다(배지는 한 번 사라지면 다시 안 뜸). 지금은
+  // 동영상 목록이 기본적으로 날짜 최신순 정렬이라는 점(헤더의 aria-sort="descending"으로
+  // 확인)을 이용해, 제목이 일치하는 행 중 가장 위(=가장 최근) 행을 그대로 쓴다 — 동명의
+  // 예전 영상이 있어도 방금 올린 것보다는 아래에 있어 섞이지 않는다.
+  // ---------------------------------------------------------------------------
+  const UPLOAD_ROW_SELECTOR = 'ytcp-video-row';
+  const UPLOAD_ROW_TITLE_SELECTOR = '#video-title';
+  const VISIBILITY_CELL_SELECTOR = '.tablecell-visibility';
+  const UPLOAD_ROW_POLL_MS = 2000;
+  // 이 제목의 행이 처음 나타나기를 기다리는 시간 — 화면에 반영되기까지의 지연만 감안하면
+  // 되므로 길 필요는 없다. 여기서 못 찾으면(제목이 안 맞음 등) 뒤 단계로 넘어가지 않고
+  // 삭제를 포기한다.
+  const UPLOAD_ROW_APPEAR_TIMEOUT_MS = 3 * 60 * 1000;
+  // 공개 상태 칸에 설정한 라벨이 뜨길 기다리는 시간 — 대용량 VOD와 느린 회선을 고려해
+  // 넉넉하게 잡는다.
+  const UPLOAD_ROW_DONE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+  // "완료"를 본 뒤에도 잠깐 더 지켜봐서 일시적인 순간이 아닌지 확인한 다음에만 삭제한다.
+  const UPLOAD_ROW_DONE_CONFIRM_MS = 5000;
 
   let bannerMessageEl = null;
   let folderButtonEl = null;
@@ -102,6 +132,8 @@
   let currentTitle = '';
   let currentDescription = '';
   let currentOptions = DEFAULT_OPTIONS;
+  let currentVideoId = null; // 업로드 확인 후 삭제 대상을 지칭하는 데만 쓰인다
+  let currentFileOrder = null;
   let fileNames = []; // 자동 첨부할 파일의 후보 이름들 (VOD 페이지가 넘겨줌)
   let downloadSubfolder = '';
   let dirHandle = null;
@@ -116,6 +148,10 @@
   // → 'saved'(저장 클릭). 재사용 가능 여부 판단에 쓴다.
   let runPhase = 'waiting';
   let dialogEverSeen = false;
+  // background가 새로고침 등으로 이 탭을 정리해 "지금 당장 재사용해도 되는 상태"라고 알려준
+  // 경우 true — dialogEverSeen 같은 휴리스틱을 기다릴 필요 없이 곧바로 재사용 가능하다고
+  // 답한다. beginRun에서 실제로 새 업로드가 시작되면 다시 false로 되돌린다.
+  let explicitlyIdle = false;
   let watchTimer = null;
   let currentRunId = 0; // 재시작 후 이전 실행의 늦은 콜백이 끼어들지 못하게 하는 세대 번호
   const saveWatchedDialogs = new WeakSet();
@@ -129,12 +165,21 @@
     } catch (error) {
       return; // 확장 컨텍스트가 아직 준비되지 않음
     }
-    if (!response?.pending) return;
+    // pending: 바로 채울 업로드 데이터가 있음. managed: 지금은 없지만(예: 새로고침 직후)
+    // 이 탭은 background가 재사용 대상으로 관리 중 — 둘 다 아니면 우리와 무관한 탭이다.
+    if (!response?.pending && !response?.managed) return;
 
-    // 우리가 연 탭에서만 background의 재사용 요청(probe/restart)에 응답한다.
+    // 우리가 관리하는 탭에서만 background의 재사용 요청(probe/restart)에 응답한다.
     chrome.runtime.onMessage.addListener(handleBackgroundMessage);
-    showBanner();
-    await beginRun(response);
+
+    if (response.pending) {
+      showBanner();
+      await beginRun(response);
+    } else {
+      // 대기열이 비어 있어 지금은 할 일이 없는 상태(새로고침으로 정리된 직후 등) — 다음
+      // probe에서 바로 재사용 가능한 것으로 응답하도록 표시해둔다.
+      explicitlyIdle = true;
+    }
   }
 
   /** 새 업로드 데이터로 상태를 초기화하고 업로드 창 감시를 (다시) 시작한다. */
@@ -145,6 +190,8 @@
     currentTitle = payload.title;
     currentDescription = payload.description;
     currentOptions = { ...DEFAULT_OPTIONS, ...(payload.options || {}) };
+    currentVideoId = payload.videoId ?? null;
+    currentFileOrder = payload.fileOrder ?? null;
     fileNames = Array.isArray(payload.fileNames) ? payload.fileNames : [];
     downloadSubfolder = payload.downloadSubfolder || '';
     forcePickFolder = false;
@@ -153,6 +200,7 @@
     attachResult = null;
     automationStarted = false;
     runPhase = 'waiting';
+    explicitlyIdle = false; // 새 업로드가 실제로 시작됐으니 더 이상 "무조건 재사용 가능"이 아니다
 
     console.log(`${LOG_TAG} 업로드 실행 시작`, currentTitle, currentOptions, fileNames);
     setBannerMessage(
@@ -183,6 +231,7 @@
    * 업로드 창을 한 번도 못 본 탭(막 열려서 아직 창이 뜨기 전)도 안전하게 재사용하지 않는다.
    */
   function isReusable() {
+    if (explicitlyIdle) return true;
     if (runPhase === 'automating') return false;
     const dialog = document.querySelector(UPLOAD_DIALOG_SELECTOR);
     if (dialog) {
@@ -439,6 +488,14 @@
       formatResults(results, true) + (popupGone ? '\n저장하고 팝업까지 자동으로 닫았습니다.' : '\n저장은 됐지만 팝업이 남아 있습니다. 직접 닫아주세요.'),
       !popupGone
     );
+
+    // 저장이 끝나 이 탭이 다시 idle해졌다는 신호 — 대기열에 다음 업로드가 있으면 background가
+    // 다음 알람/요청까지 기다리지 않고 바로 이어서 재사용을 시도할 수 있다.
+    notifyBecameIdle();
+  }
+
+  function notifyBecameIdle() {
+    chrome.runtime.sendMessage({ action: 'youtubeStudio:becameIdle' }).catch(() => {});
   }
 
   /**
@@ -572,6 +629,14 @@
           setBannerMessage('파일을 넣었지만 Studio가 반응하지 않았습니다. mp4를 직접 선택해주세요.', true);
         }
       }, ATTACH_REACTION_TIMEOUT_MS);
+
+      // "업로드 확인 후 자동 삭제"는 우리가 자동으로 첨부한 파일임이 확실할 때만 시도한다 —
+      // 사용자가 직접 다른 파일을 골랐다면(attachResult.ok가 아니었다면) 어느 로컬 파일이
+      // 실제로 올라갔는지 알 수 없어 절대 건드리지 않는다.
+      if (currentOptions.deleteAfterUpload && currentVideoId != null && currentFileOrder != null) {
+        const visibilityLabel = VISIBILITY_LABELS[currentOptions.visibility] || VISIBILITY_LABELS.unlisted;
+        watchUploadAndDelete(runId, currentTitle, visibilityLabel);
+      }
     } else {
       // 폴더가 틀렸을 가능성이 커서 다른 폴더를 고를 수 있게 한다. 자동 입력은 사용자가
       // 파일을 직접 고르면 그대로 이어진다.
@@ -582,6 +647,110 @@
         true
       );
     }
+  }
+
+  /**
+   * 로컬 파일 전송까지 끝난 것을 확인한 뒤에만 background에 삭제를 요청한다. 확인하지
+   * 못하면(제목이 안 맞음, 시간 초과 등) 그냥 삭제하지 않고 조용히 끝난다 — 삭제는 절대
+   * 낙관적으로 하지 않는다. 재시작으로 실행이 바뀌면(runId 불일치) 즉시 멈춘다.
+   */
+  async function watchUploadAndDelete(runId, title, visibilityLabel) {
+    const videoId = currentVideoId;
+    const fileOrder = currentFileOrder;
+    const tag = `${LOG_TAG} [실행 #${runId}]`;
+
+    // 주의: 탭이 재사용돼(youtubeStudio:restart) 이 사이에 새 업로드가 시작되면 currentRunId가
+    // 바뀌지만, 이 감시는 그것과 무관하게 끝까지 계속돼야 한다 — 이전 업로드의 로컬 전송이
+    // 저장 버튼을 누른 뒤에도 한참 더 걸릴 수 있는데, 여기서 포기하면 그 파일은 영영 삭제
+    // 확인이 안 된다(실제로 발견된 문제: 탭 재사용 시 이전 업로드 완료 검사가 씹혔었음).
+    // videoId/fileOrder/title/visibilityLabel은 이미 위에서 값으로 캡처해뒀으니 이후 전역
+    // 상태가 바뀌어도 안전하다.
+    const done = await waitForLocalUploadDone(tag, title, visibilityLabel);
+
+    if (!done) {
+      console.log(`${tag} 로컬 업로드 완료를 확인하지 못해 로컬 파일을 삭제하지 않음`);
+      return;
+    }
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: 'download:deleteUploaded',
+        videoId,
+        fileOrder,
+      });
+
+      // 배너는 지금 화면에 보이는(=아직 최신인) 실행의 것일 때만 건드린다 — 재사용으로 이미
+      // 새 실행이 시작됐다면 배너를 덮어써서 혼란만 주므로 콘솔 로그로만 남긴다.
+      const showBannerForThis = runId === currentRunId;
+      if (response?.success) {
+        console.log(`${tag} 업로드 확인, 로컬 파일 삭제됨: ${response.name || ''}`);
+        if (showBannerForThis) setBannerMessage(`✓ 업로드 확인, 로컬 파일을 삭제했습니다. (${response.name || ''})`);
+      } else {
+        console.warn(`${tag} 로컬 파일 삭제 실패: ${response?.error}`);
+        if (showBannerForThis) setBannerMessage(`✗ 업로드는 확인됐지만 로컬 파일 삭제 실패: ${response?.error}`, true);
+      }
+    } catch (error) {
+      console.warn(`${tag} 로컬 파일 삭제 요청 오류`, error);
+    }
+  }
+
+  /**
+   * 동영상 목록에서 이 업로드에 해당하는 행을 찾아, 그 행의 "공개 상태" 칸에 설정한
+   * 공개범위 라벨이 뜨는지를 본다. 행을 찾을 때 "업로드 중" 배지가 떠 있어야 한다는
+   * 조건을 걸었었는데, 업로드가 우리 폴링 간격(2초)보다 빨리 끝나버리면 그 배지가 뜬
+   * 순간을 놓쳐서 영영 못 찾는 문제가 실제로 있었다(배지는 한 번 사라지면 다시 안 뜸).
+   * 대신 동영상 목록이 기본적으로 날짜 최신순으로 정렬돼 있다는 점을 이용해, 제목이
+   * 일치하는 행 중 **가장 위(=DOM에 가장 먼저 나오는, 가장 최근에 올라간)** 행을 그대로
+   * 쓴다 — 동명의 예전 영상이 있어도 방금 올린 것보다는 아래에 있어 섞이지 않는다. 공개
+   * 상태 라벨이 뜬 뒤에도 잠깐 더 지켜봐서 안정적인지 확인한다. 탭 재사용으로 새 실행이
+   * 시작돼도(runId가 바뀌어도) 이 감시 자체는 멈추지 않는다 — watchUploadAndDelete의
+   * 주석 참고.
+   */
+  async function waitForLocalUploadDone(tag, title, visibilityLabel) {
+    let row = null;
+    const appeared = await waitFor(
+      () => {
+        row = findRowByTitle(title);
+        return row ? true : null;
+      },
+      UPLOAD_ROW_APPEAR_TIMEOUT_MS,
+      UPLOAD_ROW_POLL_MS
+    );
+    if (!appeared || !row) {
+      console.log(`${tag} 동영상 목록에서 이 제목의 행을 찾지 못함(제목: ${title})`);
+      return false;
+    }
+
+    const doneOnce = await waitFor(
+      () => (isVisibilityShown(row, visibilityLabel) ? true : null),
+      UPLOAD_ROW_DONE_TIMEOUT_MS,
+      UPLOAD_ROW_POLL_MS
+    );
+    if (!doneOnce) return false;
+
+    await sleep(UPLOAD_ROW_DONE_CONFIRM_MS);
+    return isVisibilityShown(row, visibilityLabel);
+  }
+
+  /** 동영상 목록에서 제목이 정확히 일치하는 행 중 가장 위(=최신순 정렬 기준 가장 최근) 행. */
+  function findRowByTitle(title) {
+    const target = normalize(title);
+    const rows = document.querySelectorAll(UPLOAD_ROW_SELECTOR);
+    for (const row of rows) {
+      const titleEl = row.querySelector(UPLOAD_ROW_TITLE_SELECTOR);
+      if (!titleEl) continue;
+      const label = normalize(titleEl.getAttribute('aria-label') || titleEl.textContent);
+      if (label === target) return row;
+    }
+    return null;
+  }
+
+  /** "공개 상태" 칸에 설정한 공개범위 라벨이 정확히 표시됐는지(부분 일치 금지 — "공개"는
+   * "비공개"/"일부 공개"의 부분 문자열이라 포함 검사로는 서로 헷갈릴 수 있다). */
+  function isVisibilityShown(row, expectedLabel) {
+    const cell = row.querySelector(VISIBILITY_CELL_SELECTOR);
+    if (!cell) return false;
+    return normalize(cell.textContent) === expectedLabel;
   }
 
   async function attachFile(input) {

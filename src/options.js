@@ -34,6 +34,7 @@ const DEFAULT_SETTINGS = {
       youtubeNotForKids: true,
       youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
       downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
+      deleteLocalFileAfterUpload: false, // 업로드(파일 전송) 완료가 확인되면 로컬 mp4 자동 삭제. 기본 꺼짐(되돌릴 수 없음)
     },
   },
 };
@@ -68,6 +69,7 @@ const el = {
   downloadSubfolder: document.getElementById('downloadSubfolder'),
   youtubeVisibility: document.getElementById('youtubeVisibility'),
   youtubeNotForKids: document.getElementById('youtubeNotForKids'),
+  deleteLocalFileAfterUpload: document.getElementById('deleteLocalFileAfterUpload'),
   newYoutubePlaylist: document.getElementById('newYoutubePlaylist'),
   addYoutubePlaylistBtn: document.getElementById('addYoutubePlaylistBtn'),
   youtubePlaylistList: document.getElementById('youtubePlaylistList'),
@@ -123,6 +125,7 @@ function renderAll() {
   el.downloadSubfolder.value = vodFileInfo.downloadSubfolder;
   el.youtubeVisibility.value = vodFileInfo.youtubeVisibility;
   el.youtubeNotForKids.checked = vodFileInfo.youtubeNotForKids;
+  el.deleteLocalFileAfterUpload.checked = vodFileInfo.deleteLocalFileAfterUpload;
   updateCardBodyState(el.vodFileInfoBody, vodFileInfo.enabled);
   renderYoutubePlaylists();
 }
@@ -311,6 +314,11 @@ function setupEventListeners() {
 
   el.youtubeNotForKids.addEventListener('change', (e) => {
     settings.features.vodFileInfo.youtubeNotForKids = e.target.checked;
+    persistSettings();
+  });
+
+  el.deleteLocalFileAfterUpload.addEventListener('change', (e) => {
+    settings.features.vodFileInfo.deleteLocalFileAfterUpload = e.target.checked;
     persistSettings();
   });
 

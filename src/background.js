@@ -6,6 +6,10 @@
 import { isStreamerLive, getLoginId, getMissionStatus, getSoopVodInfo } from './soopLiveApi.js';
 import { indexYoutubeUploads, matchVodFiles } from './youtubeMatch.js';
 
+// 지금 로드된 게 최신 버전인지 콘솔에서 바로 확인할 수 있도록, 서비스 워커가 깨어날 때마다
+// (설치/재시작/업데이트 후 첫 실행 포함) manifest.json의 version을 그대로 찍는다.
+console.log(`[나만의 SOOP 확프] 백그라운드 시작 (v${chrome.runtime.getManifest().version})`);
+
 const LOG_TAG = '[LiveMonitor]';
 const LIVE_CHECK_ALARM_NAME = 'liveCheck';
 const MIN_POLL_INTERVAL_MINUTES = 1;
@@ -49,6 +53,7 @@ const DEFAULT_SETTINGS = {
       youtubeNotForKids: true,
       youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
       downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
+      deleteLocalFileAfterUpload: false, // 업로드(파일 전송) 완료가 확인되면 로컬 mp4 자동 삭제. 기본 꺼짐(되돌릴 수 없음)
     },
   },
 };
@@ -124,6 +129,27 @@ async function setPendingStudioUploads(pendingStudioUploads) {
   await chrome.storage.session.set({ pendingStudioUploads });
 }
 
+// 업로드 탭은 딱 하나만 두고 무조건 재사용한다(탭이 여러 개면 백그라운드 탭이 돼 렌더링/타이머가
+// 느려지면서 자동화 버튼이 안 뜨는 문제가 있었다). 처리하지 못한 요청은 큐에 쌓아두고, 탭이
+// 준비되는 대로(재사용 성공, 새로고침 후 재접속, 다음 알람 등) 순서대로 하나씩 배정한다.
+async function getStudioTabId() {
+  const { studioTabId } = await chrome.storage.session.get(['studioTabId']);
+  return studioTabId ?? null;
+}
+
+async function setStudioTabId(studioTabId) {
+  await chrome.storage.session.set({ studioTabId });
+}
+
+async function getStudioUploadQueue() {
+  const { studioUploadQueue } = await chrome.storage.session.get(['studioUploadQueue']);
+  return studioUploadQueue || [];
+}
+
+async function setStudioUploadQueue(studioUploadQueue) {
+  await chrome.storage.session.set({ studioUploadQueue });
+}
+
 /** Studio 탭의 content script에 전달할 데이터(제목/설명/파일 후보/저장된 옵션)를 만든다. */
 async function buildStudioPayload(entry) {
   const { vodFileInfo } = (await getSettings()).features;
@@ -131,11 +157,16 @@ async function buildStudioPayload(entry) {
     title: entry.title,
     description: entry.description,
     fileNames: entry.fileNames || [],
+    // 자동 첨부가 실제로 성공했을 때만(=어느 로컬 파일인지 확실할 때만) "업로드 확인 후 삭제"를
+    // 시도할 수 있어야 하므로, 그 파일을 정확히 지칭할 videoId/fileOrder를 같이 넘겨준다.
+    videoId: entry.videoId ?? null,
+    fileOrder: entry.fileOrder ?? null,
     downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
     options: {
       visibility: vodFileInfo.youtubeVisibility,
       notForKids: vodFileInfo.youtubeNotForKids,
       playlists: vodFileInfo.youtubePlaylists,
+      deleteAfterUpload: vodFileInfo.deleteLocalFileAfterUpload,
     },
   };
 }
@@ -183,47 +214,90 @@ function sendToTab(tabId, message, timeoutMs) {
   });
 }
 
+// 재사용 실패(탭은 idle로 보이는데 자동화가 안 먹힌 경우) 후 새로고침을 다시 시도하기까지
+// 최소 간격 — 새로고침이 beforeunload 확인 창에 막히는 상황에서 매번 새 확인 창을 계속
+//띄워 사용자를 귀찮게 하지 않기 위함.
+const STUDIO_RELOAD_COOLDOWN_MS = 3 * 60 * 1000;
+let lastStudioReloadAttemptAt = 0;
+let studioQueueDraining = false;
+
 /**
- * 우리가 열었던 Studio 탭 중 지금 업로드 창이 비어 있는(저장까지 끝난) 탭을 찾아, 그 탭에서
- * 새 업로드를 시작시킨다. 성공하면 그 탭의 id를, 재사용할 탭이 없거나 실패하면 null을 반환한다
- * (호출부가 새 탭을 여는 것으로 넘어간다). 진행 중이거나 저장 전인 업로드 창이 열린 탭은
- * content script가 재사용 불가로 답하므로 절대 건드리지 않는다.
+ * 업로드 대기열을 앞에서부터 순서대로 처리한다. 재사용할 탭이 없으면(맨 처음, 또는 탭이
+ * 닫혔으면) 이번 한 번만 새로 열고, 그 뒤로는 그 탭만 계속 재사용한다 — 탭을 여러 개
+ * 띄우면 백그라운드 탭이 돼 렌더링/타이머가 느려지면서 자동화가 실패하는 문제가 있었다.
+ * 탭이 idle로 보이는데(probe: reusable) 실제 재시작이 실패하면(아마 같은 이유로 버튼이
+ * 아직 안 뜬 상태) 새로고침으로 복구를 시도한다. 새로고침 자체가 막히면(업로드 중이라
+ * 나가기 확인 창이 뜨는 경우) 큐는 그대로 두고 물러난다 — 사용자가 그 확인 창을 해결해
+ * 탭이 다시 로드되면 그 탭의 content script가 init()으로 큐 맨 앞 항목을 스스로 받아간다.
  */
-async function tryReuseStudioTab(entry) {
-  const pending = await getPendingStudioUploads();
-  const payload = await buildStudioPayload(entry);
-  let pendingChanged = false;
+async function drainStudioQueue() {
+  if (studioQueueDraining) return;
+  studioQueueDraining = true;
+  try {
+    for (;;) {
+      const queue = await getStudioUploadQueue();
+      if (queue.length === 0) break;
+      const entry = queue[0];
 
-  for (const idText of Object.keys(pending)) {
-    const tabId = Number(idText);
+      let tabId = await getStudioTabId();
+      if (tabId != null) {
+        try {
+          await chrome.tabs.get(tabId);
+        } catch (error) {
+          tabId = null;
+          await setStudioTabId(null);
+        }
+      }
 
-    let tab;
-    try {
-      tab = await chrome.tabs.get(tabId);
-    } catch (error) {
-      delete pending[idText]; // 이미 닫힌 탭
-      pendingChanged = true;
-      continue;
+      if (tabId == null) {
+        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
+        await setStudioTabId(tab.id);
+        const pending = await getPendingStudioUploads();
+        pending[tab.id] = entry;
+        await setPendingStudioUploads(pending);
+        await setStudioUploadQueue(queue.slice(1));
+        console.log(`${STUDIO_LOG_TAG} 새 Studio 탭 생성 (tabId=${tab.id}), 제목: ${entry.title}`);
+        continue;
+      }
+
+      const payload = await buildStudioPayload(entry);
+      const probe = await sendToTab(tabId, { action: 'youtubeStudio:probe' }, 2000);
+      if (!probe?.reusable) break; // 아직 바쁨(정상) — 나중에(becameIdle/새 요청/알람) 다시 시도
+
+      const result = await sendToTab(tabId, { action: 'youtubeStudio:restart', payload }, 25000);
+      if (result?.started) {
+        const pending = await getPendingStudioUploads();
+        pending[tabId] = entry; // 탭이 새로고침돼도 최신 업로드 데이터로 이어지게 갱신
+        await setPendingStudioUploads(pending);
+        await chrome.tabs.update(tabId, { active: true });
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          await chrome.windows.update(tab.windowId, { focused: true });
+        } catch (error) {
+          // 포커스만 실패한 것 — 업로드 자체는 이미 시작됐으니 무시
+        }
+        await setStudioUploadQueue(queue.slice(1));
+        console.log(`${STUDIO_LOG_TAG} 기존 Studio 탭 재사용 (tabId=${tabId}), 제목: ${entry.title}`);
+        continue;
+      }
+
+      console.warn(`${STUDIO_LOG_TAG} 탭이 idle로 보이는데 재사용 실패(${result?.reason || '응답 없음'}) — 새로고침으로 복구 시도`);
+      const now = Date.now();
+      if (now - lastStudioReloadAttemptAt < STUDIO_RELOAD_COOLDOWN_MS) break;
+      lastStudioReloadAttemptAt = now;
+      try {
+        await chrome.tabs.reload(tabId);
+      } catch (error) {
+        console.warn(`${STUDIO_LOG_TAG} 탭 새로고침 요청 실패:`, error.message);
+      }
+      // 큐는 건드리지 않고 물러난다. 새로고침이 실제로 진행됐다면 그 탭이 다시 뜬 뒤
+      // youtubeStudio:init에서 큐 맨 앞 항목을 스스로 받아간다(아래 핸들러 참고). 업로드
+      // 중이라 확인 창에 막혔다면 사용자가 해결한 뒤 같은 방식으로 이어진다.
+      break;
     }
-
-    const probe = await sendToTab(tabId, { action: 'youtubeStudio:probe' }, 2000);
-    if (!probe?.reusable) continue;
-
-    const result = await sendToTab(tabId, { action: 'youtubeStudio:restart', payload }, 25000);
-    if (!result?.started) {
-      console.log(`${STUDIO_LOG_TAG} 탭 재사용 실패 (tabId=${tabId}): ${result?.reason || '응답 없음'}`);
-      continue;
-    }
-
-    pending[idText] = entry; // 탭이 새로고침돼도 최신 업로드 데이터로 이어지게 갱신
-    await setPendingStudioUploads(pending);
-    await chrome.tabs.update(tabId, { active: true });
-    await chrome.windows.update(tab.windowId, { focused: true });
-    return tabId;
+  } finally {
+    studioQueueDraining = false;
   }
-
-  if (pendingChanged) await setPendingStudioUploads(pending);
-  return null;
 }
 
 /**
@@ -289,7 +363,13 @@ async function getStorageOverview() {
   const { vodFileInfo } = (await getSettings()).features;
   const subfolder = normalizeSubfolder(vodFileInfo.downloadSubfolder);
   const { downloadedFiles = {} } = await chrome.storage.local.get(['downloadedFiles']);
-  const knownNames = new Set(Object.values(downloadedFiles).map((f) => f.name));
+  // 이미 지운 것으로 기록된 파일은 제외한다 — chrome.downloads의 exists 갱신이
+  // 최대 10초 지연될 수 있어(문서 기준), 우리가 확실히 아는 삭제를 우선한다.
+  const knownNames = new Set(
+    Object.values(downloadedFiles)
+      .filter((f) => !f.deletedAt)
+      .map((f) => f.name)
+  );
 
   const items = await chrome.downloads.search({ state: 'complete', exists: true, limit: 0 });
   const mine = items.filter((item) => {
@@ -323,7 +403,9 @@ chrome.downloads.onChanged.addListener(async (delta) => {
     const [item] = await chrome.downloads.search({ id: delta.id });
     if (item?.filename) {
       const name = item.filename.split(/[\\/]/).pop();
-      downloadedFiles[`${tracked.videoId}:${tracked.fileOrder}`] = { name, savedAt: Date.now() };
+      // downloadId를 같이 기록해두면 나중에 "업로드 확인 후 자동 삭제"에서 파일명으로 다시
+      // 찾을 필요 없이 chrome.downloads.removeFile(downloadId)로 바로, 정확하게 지울 수 있다.
+      downloadedFiles[`${tracked.videoId}:${tracked.fileOrder}`] = { name, savedAt: Date.now(), downloadId: delta.id };
       downloadOutcomes[delta.id] = { ok: true, name, recordedAt: Date.now() };
       console.log(`${STUDIO_LOG_TAG} 다운로드 완료 기록: ${tracked.videoId}:${tracked.fileOrder} → ${name}`);
     } else {
@@ -448,6 +530,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === LIVE_CHECK_ALARM_NAME) {
     console.log(`${LOG_TAG} 알람 발생 - 주기적 조회 시작`);
     runLiveCheck();
+    // Studio 업로드 대기열이 남아 있는데(예: 새로고침이 확인 창에 막혀서) 아무 신호도 못
+    // 받았을 경우를 대비한 안전망. 큐가 비어 있으면 drainStudioQueue가 바로 끝난다.
+    drainStudioQueue();
   }
 });
 
@@ -475,6 +560,10 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (tabId in pending) {
     delete pending[tabId];
     await setPendingStudioUploads(pending);
+  }
+  // 재사용 대상 탭 자체가 닫혔다면 기록을 지워서, 다음 대기열 처리 때 새 탭을 하나 연다.
+  if ((await getStudioTabId()) === tabId) {
+    await setStudioTabId(null);
   }
 });
 
@@ -591,38 +680,64 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           title: request.title,
           description: request.description,
           fileNames: Array.isArray(request.fileNames) ? request.fileNames : [],
+          videoId: request.videoId ?? null,
+          fileOrder: request.fileOrder != null ? Number(request.fileOrder) : null,
         };
 
-        // 이미 열려 있고 저장까지 끝난(놀고 있는) Studio 탭이 있으면 새 탭을 열지 않고
-        // 그 탭에서 "동영상 업로드"만 다시 눌러 새 업로드 데이터로 이어서 진행한다.
-        const reusedTabId = await tryReuseStudioTab(entry);
-        if (reusedTabId != null) {
-          console.log(`${STUDIO_LOG_TAG} 기존 Studio 탭 재사용 (tabId=${reusedTabId}), 제목: ${entry.title}`);
-          sendResponse({ success: true, reused: true });
-          return;
-        }
-
-        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
-        const pending = await getPendingStudioUploads();
-        pending[tab.id] = entry;
-        await setPendingStudioUploads(pending);
-        console.log(`${STUDIO_LOG_TAG} 업로드 탭 열림 (tabId=${tab.id}), 제목: ${request.title}`);
-        sendResponse({ success: true, reused: false });
+        // 무조건 대기열에 넣고 나서 처리를 시도한다 — 탭이 이미 바쁘면(정상) 대기열에
+        // 그대로 남아 있다가 순서대로 처리된다. 탭을 여러 개 띄우지 않는다(항상 하나만
+        // 재사용, 없을 때만 딱 한 번 새로 연다).
+        const queue = await getStudioUploadQueue();
+        queue.push(entry);
+        await setStudioUploadQueue(queue);
+        console.log(`${STUDIO_LOG_TAG} 업로드 대기열에 추가 (대기 ${queue.length}개), 제목: ${entry.title}`);
+        sendResponse({ success: true, queued: true });
       } catch (error) {
-        console.error(`${STUDIO_LOG_TAG} 업로드 탭 열기 오류:`, error);
+        console.error(`${STUDIO_LOG_TAG} 업로드 요청 처리 오류:`, error);
         sendResponse({ success: false, error: error.message });
       }
+      drainStudioQueue(); // 응답은 이미 보냈으니 결과를 기다리지 않고 바로 처리 시도
     })();
     return true;
+  }
+
+  if (request.action === 'youtubeStudio:becameIdle') {
+    // 어떤 Studio 탭이 저장까지 마치고 놀고 있는 상태가 됐다는 신호 — 대기열에 남은 게
+    // 있으면 다음 알람/요청을 기다리지 않고 바로 이어서 처리한다.
+    drainStudioQueue();
+    return false;
   }
 
   if (request.action === 'youtubeStudio:init') {
     (async () => {
       const tabId = sender.tab?.id;
-      const pending = await getPendingStudioUploads();
-      const entry = tabId != null ? pending[tabId] : undefined;
-      if (!entry) {
+      if (tabId == null) {
         sendResponse({ pending: false });
+        return;
+      }
+
+      const pending = await getPendingStudioUploads();
+      let entry = pending[tabId];
+
+      if (!entry) {
+        // 이 탭에 아직 배정된 항목이 없다 — 우리가 재사용하려는 그 탭이거나(새로고침 직후 등)
+        // 탭이 아직 없어서 방금 새로 연 탭이라면, 대기열 맨 앞 항목을 지금 바로 배정한다.
+        const studioTabId = await getStudioTabId();
+        if (studioTabId == null || studioTabId === tabId) {
+          const queue = await getStudioUploadQueue();
+          if (queue.length > 0) {
+            entry = queue[0];
+            await setStudioUploadQueue(queue.slice(1));
+            pending[tabId] = entry;
+            await setPendingStudioUploads(pending);
+            if (studioTabId == null) await setStudioTabId(tabId);
+          }
+        }
+      }
+
+      if (!entry) {
+        const managed = (await getStudioTabId()) === tabId;
+        sendResponse({ pending: false, managed });
         return;
       }
       console.log(`${STUDIO_LOG_TAG} Studio 탭에 제목/설명/옵션 전달 (tabId=${tabId})`);
@@ -662,6 +777,42 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .cancel(Number(request.downloadId))
       .then(() => sendResponse({ success: true }))
       .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
+  if (request.action === 'download:deleteUploaded') {
+    (async () => {
+      try {
+        const key = `${request.videoId}:${Number(request.fileOrder)}`;
+        const { downloadedFiles = {} } = await chrome.storage.local.get(['downloadedFiles']);
+        const record = downloadedFiles[key];
+        // downloadId로 기록해둔 "바로 그 파일"만 지운다 — 파일명 재검색 같은 추측성 매칭은
+        // 절대 하지 않는다(비슷한 이름의 다른 파일을 잘못 지우면 되돌릴 수 없다).
+        if (!record?.downloadId) {
+          sendResponse({ success: false, error: '삭제할 다운로드 기록을 찾지 못함' });
+          return;
+        }
+        if (record.deletedAt) {
+          sendResponse({ success: true, alreadyDeleted: true });
+          return;
+        }
+
+        await new Promise((resolve, reject) => {
+          chrome.downloads.removeFile(record.downloadId, () => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve();
+          });
+        });
+
+        downloadedFiles[key] = { ...record, deletedAt: Date.now() };
+        await chrome.storage.local.set({ downloadedFiles });
+        console.log(`${STUDIO_LOG_TAG} 업로드 확인 후 로컬 파일 삭제: ${key} → ${record.name}`);
+        sendResponse({ success: true, name: record.name });
+      } catch (error) {
+        console.error(`${STUDIO_LOG_TAG} 로컬 파일 삭제 실패:`, error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
     return true;
   }
 

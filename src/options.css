@@ -225,6 +225,12 @@ button {
   text-decoration: line-through;
 }
 
+.field-hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #dc2626;
+}
+
 .empty-hint {
   font-size: 13px;
   color: #9ca3af;
