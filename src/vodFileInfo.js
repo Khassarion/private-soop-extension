@@ -106,7 +106,101 @@
       loadVodFileInfo(contentEl);
     });
 
-    loadVodFileInfo(contentEl);
+    loadVodFileInfo(contentEl).then((renderResult) => maybeRunPipeline(panelElement, renderResult));
+  }
+
+  /**
+   * 다시보기 목록 페이지의 "모두 업로드"가 시작한 파이프라인이 이 다시보기를 맡겼는지
+   * background에 물어보고, 맡겼다면 패널을 펼친 뒤 "모두 다운로드&업로드"를 사용자 클릭
+   * 없이 그대로 돌린다. 끝나면(성공/실패 무관하게 로컬 단계가 다 끝나면) 실패한 파일
+   * 목록을 background에 알려서, Studio 확인 신호가 절대 안 올 파일을 영원히 기다리지
+   * 않게 한다. 이 다시보기가 지금 파이프라인 차례가 아니면 아무것도 하지 않는다 — 평소
+   * 수동 사용에는 전혀 영향이 없다.
+   */
+  async function maybeRunPipeline(panelElement, renderResult) {
+    const videoId = getVideoIdFromLocation();
+    if (!videoId || !renderResult) return;
+
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({ action: 'vodPipeline:initPlayer', videoId });
+    } catch (error) {
+      return;
+    }
+    if (!response?.active) return;
+
+    console.log(`${LOG_TAG} 파이프라인이 이 다시보기를 맡김: ${videoId}`);
+    panelElement.classList.remove('collapsed');
+    // 새로고침 등으로 이 탭이 새로 뜬 시점에 이미 일시정지 상태였을 수 있다 — 그 경우
+    // 배치를 시작하자마자 첫 파일 전에 멈춰 서도록 미리 반영해둔다.
+    pipelinePaused = Boolean(response.paused);
+    // 무인 배치가 도는 동안은 영상이 재생될 이유가 없다(볼 사람이 없고 대역폭만 낭비함) —
+    // 페이지가 로드되자마자(자동재생 포함) 곧바로 멈춰두고 배치가 끝나면 풀어준다.
+    startPipelineVideoPause();
+
+    try {
+      await chrome.runtime.sendMessage({ action: 'vodPipeline:filesTotal', videoId, fileOrders: renderResult.fileOrders });
+    } catch (error) {
+      // 총 파일 수를 못 알렸어도 배치는 그대로 진행한다 — background는 알람으로 결국
+      // 이 다시보기를 시간 초과 처리하고 다음으로 넘어간다(안전망).
+    }
+
+    pipelineUploadActive = true;
+    // 목록 페이지가 미리 판별해둔, 이 다시보기에서 유튜브에 이미 올라가 있는 파일들 —
+    // 배치가 이 파일들은 다시 다운로드/업로드하지 않고 건너뛰도록 그대로 넘긴다.
+    const { failOrders } = await renderResult.runBatch(response.alreadyUploadedFileOrders || []);
+    pipelineUploadActive = false;
+    stopPipelineVideoPause();
+
+    try {
+      // failOrders: [{fileOrder, reason}] — background가 각 실패를 로그/알림/저장소
+      // 히스토리에 남길 수 있도록 이유까지 그대로 전달한다.
+      await chrome.runtime.sendMessage({ action: 'vodPipeline:localBatchDone', videoId, failures: failOrders });
+    } catch (error) {
+      // 마찬가지로 알림에 실패해도 알람 안전망이 결국 처리한다.
+    }
+  }
+
+  // 파이프라인 배치가 도는 동안 영상 재생을 막는다. 플레이어가 페이지 로드 뒤 늦게
+  // <video>를 만들 수도 있고, 자동재생이 붙을 수도 있어 liveMonitor.js와 같은 방식으로
+  // MutationObserver로 계속 지켜보다가 재생이 시작되면 즉시 다시 멈춘다.
+  let pipelineVideoObserver = null;
+  let pipelineWatchedVideo = null;
+
+  function pipelineEnforcePause() {
+    if (pipelineWatchedVideo && !pipelineWatchedVideo.paused) {
+      pipelineWatchedVideo.pause();
+    }
+  }
+
+  function pipelineTryAttachVideo() {
+    const video = document.querySelector('video');
+    if (!video || video === pipelineWatchedVideo) {
+      pipelineEnforcePause();
+      return;
+    }
+    if (pipelineWatchedVideo) pipelineWatchedVideo.removeEventListener('play', pipelineEnforcePause);
+    pipelineWatchedVideo = video;
+    video.addEventListener('play', pipelineEnforcePause);
+    pipelineEnforcePause();
+  }
+
+  function startPipelineVideoPause() {
+    pipelineTryAttachVideo();
+    pipelineVideoObserver = new MutationObserver(pipelineTryAttachVideo);
+    pipelineVideoObserver.observe(document.documentElement, { childList: true, subtree: true });
+    console.log(`${LOG_TAG} 파이프라인 처리 중 영상 재생 정지 시작`);
+  }
+
+  function stopPipelineVideoPause() {
+    if (pipelineVideoObserver) {
+      pipelineVideoObserver.disconnect();
+      pipelineVideoObserver = null;
+    }
+    if (pipelineWatchedVideo) {
+      pipelineWatchedVideo.removeEventListener('play', pipelineEnforcePause);
+      pipelineWatchedVideo = null;
+    }
   }
 
   async function loadVodFileInfo(contentEl) {
@@ -131,7 +225,7 @@
       return;
     }
 
-    renderFiles(contentEl, response.data, videoId);
+    return renderFiles(contentEl, response.data, videoId);
   }
 
   function renderFiles(contentEl, data, videoId) {
@@ -242,6 +336,52 @@
     runAllButton.addEventListener('click', () =>
       runDownloadUploadAll(metas, videoId, getDownloadFileList, fileControls, runAllButton, stopButton, batchStatus)
     );
+
+    // 다시보기 파이프라인이 "모두 다운로드&업로드"를 버튼 클릭 없이 그대로 돌릴 수 있도록,
+    // 실행 함수와 완료 판정에 쓸 fileOrder 목록을 돌려준다. alreadyUploadedFileOrders는
+    // 파이프라인만 알고 있는(목록 페이지가 미리 판별해둔) 정보라 수동 클릭 쪽은 항상 빈
+    // 배열로 호출해 기존 동작 그대로 둔다.
+    return {
+      fileOrders: metas.map((meta) => meta.fileOrder),
+      runBatch: (alreadyUploadedFileOrders = []) =>
+        runDownloadUploadAll(metas, videoId, getDownloadFileList, fileControls, runAllButton, stopButton, batchStatus, alreadyUploadedFileOrders),
+    };
+  }
+
+  // 지금 돌고 있는 배치를 원격(파이프라인의 vodPipeline:cancelCurrent)에서도 멈출 수 있도록,
+  // "배치 중단" 버튼과 같은 동작을 하는 함수를 실행 중인 동안만 여기에 등록해둔다.
+  let activeBatchCancelTrigger = null;
+  // maybeRunPipeline이 배치를 돌리는 동안만 true — uploadFile()이 이 값을 그대로
+  // youtubeStudio:open에 실어 보내, Studio 쪽이 삭제 설정과 무관하게 업로드 확인 신호를
+  // background에 보내도록 한다.
+  let pipelineUploadActive = false;
+  // 배치 진행 중(파일 사이)에만 폴링하는 일시정지 플래그 — background의 vodPipeline:pause/
+  // resume이 vodPipeline:setPaused로 이 탭에 알려준다. 이미 시작된 다운로드/업로드는
+  // 되돌리지 않고, 다음 파일로 넘어가기 전에만 멈춰 선다.
+  let pipelinePaused = false;
+  const PAUSE_POLL_MS = 500;
+  chrome.runtime.onMessage.addListener((request) => {
+    if (request?.action === 'vodPipeline:cancelCurrent') {
+      activeBatchCancelTrigger?.();
+    }
+    if (request?.action === 'vodPipeline:setPaused') {
+      pipelinePaused = Boolean(request.paused);
+      console.log(`${LOG_TAG} 파이프라인 배치 ${pipelinePaused ? '일시정지' : '재개'}`);
+    }
+  });
+
+  /**
+   * pipelinePaused가 true인 동안 다음 파일 처리를 시작하지 않고 기다린다. shouldCancel()이
+   * true가 되면(배치 중단) 즉시 빠져나온다 — 일시정지 중에도 중단은 항상 우선한다.
+   */
+  async function waitWhilePaused(batchStatus, shouldCancel) {
+    if (!pipelinePaused) return;
+    const originalText = batchStatus.textContent;
+    batchStatus.textContent = '일시정지됨. 재개를 누르면 이어서 진행합니다.';
+    while (pipelinePaused && !shouldCancel()) {
+      await sleep(PAUSE_POLL_MS);
+    }
+    if (!shouldCancel()) batchStatus.textContent = originalText;
   }
 
   /**
@@ -250,8 +390,14 @@
    * 넘어간다. 업로드 자체(Studio에서의 자동 입력·저장)가 끝나길 기다리지는 않는다 — 그건 별도
    * 탭에서 진행되며, 다음 파일을 내려받는 동안 백그라운드로 계속된다. 실패한 파일이 있어도
    * 배치 전체를 멈추지 않고 다음 파일로 넘어간다.
-   * "배치 중단"을 누르면 진행 중이던 다운로드를 취소하고 남은 파일은 처리하지 않는다. 이미
-   * 시작된 업로드(Studio 탭)는 되돌리지 않는다.
+   * "배치 중단"을 누르면(또는 파이프라인이 원격으로 중단시키면) 진행 중이던 다운로드를
+   * 취소하고 남은 파일은 처리하지 않는다. 이미 시작된 업로드(Studio 탭)는 되돌리지 않는다.
+   * 다시보기 파이프라인이 "이 다시보기의 업로드 확인을 영원히 기다리지 않도록" 판단할 수
+   * 있게, 로컬 단계(다운로드/업로드 시작)에서 끝내 실패했거나 처리하지 못한 파일의
+   * fileOrder 목록을 successOrders/failOrders로 묶어 돌려준다.
+   * alreadyUploadedFileOrders에 들어있는 fileOrder는 유튜브에 이미 올라가 있는 것으로
+   * 확인된 파일이라, 다운로드도 업로드도 새로 시작하지 않고 곧바로 성공으로 처리한다
+   * (수동 버튼 클릭 경로는 이 정보를 모르므로 항상 빈 배열로 호출돼 기존과 동일하다).
    */
   async function runDownloadUploadAll(
     metas,
@@ -260,18 +406,21 @@
     fileControls,
     runAllButton,
     stopButton,
-    batchStatus
+    batchStatus,
+    alreadyUploadedFileOrders = []
   ) {
     let cancelled = false;
     const shouldCancel = () => cancelled;
-    stopButton.hidden = false;
-    stopButton.disabled = false;
-    stopButton.textContent = '배치 중단';
-    stopButton.onclick = () => {
+    const cancelTrigger = () => {
       cancelled = true;
       stopButton.disabled = true;
       stopButton.textContent = '중단하는 중...';
     };
+    stopButton.hidden = false;
+    stopButton.disabled = false;
+    stopButton.textContent = '배치 중단';
+    stopButton.onclick = cancelTrigger;
+    activeBatchCancelTrigger = cancelTrigger;
 
     const originalLabel = runAllButton.textContent;
     runAllButton.disabled = true;
@@ -282,49 +431,91 @@
     batchStatus.textContent = '';
     batchStatus.classList.remove('error');
 
-    let successCount = 0;
-    let failCount = 0;
+    const successOrders = [];
+    // 실패한 fileOrder와 그 이유를 같이 들고 있는다 — 파이프라인이 "무엇이 왜 실패했는지"를
+    // 로그/알림/저장소 히스토리에 그대로 남길 수 있어야 한다(사용자가 반드시 알아야 함).
+    const failOrders = [];
     let processed = 0; // 중단 시 "처리하지 않은 파일" 개수 계산용
+    // 실제로 다운로드가 진행되던 도중에 중단된 파일의 fileOrder — 일시정지 대기 중에 중단된
+    // 경우(아무 파일도 실제로는 처리 중이 아니었음)와 구분하려고 실제 중단 지점에서 직접
+    // 기록한다(processed > 0이라는 간접 추론은 일시정지-중 취소 시 틀릴 수 있어 쓰지 않는다).
+    let cancelledMidFlightFileOrder = null;
 
     for (let i = 0; i < metas.length; i += 1) {
+      if (cancelled) break;
+      // 다음 파일을 시작하기 전에만 일시정지를 확인한다 — 이미 시작된 다운로드/업로드는
+      // 되돌리지 않고 끝까지 진행한 뒤, 파일과 파일 "사이"에서만 멈춰 선다.
+      await waitWhilePaused(batchStatus, shouldCancel);
       if (cancelled) break;
       const meta = metas[i];
       const { statusEl } = fileControls[i];
       runAllButton.textContent = `${originalLabel} (${i + 1}/${metas.length} 진행 중)`;
       processed = i + 1;
 
-      const downloadResult = await downloadFile(meta, videoId, getDownloadFileList, (text, isError) =>
-        setStatus(statusEl, text, isError)
-      );
-      if (!downloadResult.ok) {
-        failCount += 1;
+      // 유튜브에 이미 올라가 있는 것으로 확인된 파일은 다운로드도 업로드도 새로 시작하지
+      // 않는다 — 안 그러면 다시보기 일부만 올려둔 상태에서 배치를 다시 돌릴 때 이미 올라간
+      // 파일까지 중복으로 재업로드하게 된다. Studio 확인 신호가 이 파일에 대해서는 절대
+      // 오지 않을 것이므로(watchUploadAndDelete를 아예 거치지 않음) 파이프라인에도 직접
+      // "확인됨"으로 알려 무한정 기다리지 않게 한다.
+      if (alreadyUploadedFileOrders.includes(meta.fileOrder)) {
+        setStatus(statusEl, '이미 유튜브에 업로드된 파일입니다 — 건너뜀', false);
+        successOrders.push(meta.fileOrder);
+        chrome.runtime.sendMessage({ action: 'vodPipeline:fileConfirmed', videoId, fileOrder: meta.fileOrder }).catch(() => {});
         continue;
-      }
-      if (cancelled) {
-        await cancelDownload(downloadResult.downloadId);
-        setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
-        break;
       }
 
-      setStatus(statusEl, '다운로드 완료 확인 중...', false);
-      const outcome = await waitForDownloadOutcome(downloadResult.downloadId, DOWNLOAD_WAIT_TIMEOUT_MS, shouldCancel);
-      if (outcome?.cancelled) {
-        await cancelDownload(downloadResult.downloadId);
-        setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
-        break;
-      }
-      if (!outcome?.ok) {
-        setStatus(statusEl, `다운로드 실패: ${outcome?.error || '완료 확인 시간 초과'}`, true);
-        failCount += 1;
-        continue;
+      // 이미 다운로드해둔 파일이 디스크에 그대로 남아 있으면(기록만 믿지 않고 background가
+      // chrome.downloads로 실제 존재를 재확인) 무조건 다시 받지 않고 바로 업로드로 넘어간다.
+      const existing = await checkAlreadyDownloaded(videoId, meta.fileOrder);
+      if (existing.exists) {
+        setStatus(statusEl, `이미 다운로드된 파일을 그대로 사용합니다${existing.name ? ` (${existing.name})` : ''}`, false);
+      } else {
+        const downloadResult = await downloadFile(meta, videoId, getDownloadFileList, (text, isError) =>
+          setStatus(statusEl, text, isError)
+        );
+        if (!downloadResult.ok) {
+          failOrders.push({ fileOrder: meta.fileOrder, reason: downloadResult.error || '다운로드 실패' });
+          continue;
+        }
+        if (cancelled) {
+          await cancelDownload(downloadResult.downloadId);
+          setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
+          cancelledMidFlightFileOrder = meta.fileOrder;
+          break;
+        }
+
+        setStatus(statusEl, '다운로드 완료 확인 중...', false);
+        const outcome = await waitForDownloadOutcome(downloadResult.downloadId, DOWNLOAD_WAIT_TIMEOUT_MS, shouldCancel);
+        if (outcome?.cancelled) {
+          await cancelDownload(downloadResult.downloadId);
+          setStatus(statusEl, '중단됨: 다운로드를 취소했습니다.', true);
+          cancelledMidFlightFileOrder = meta.fileOrder;
+          break;
+        }
+        if (!outcome?.ok) {
+          const reason = outcome?.error || '다운로드 완료 확인 시간 초과';
+          setStatus(statusEl, `다운로드 실패: ${reason}`, true);
+          failOrders.push({ fileOrder: meta.fileOrder, reason });
+          continue;
+        }
       }
 
       const uploadResult = await uploadFile(meta, videoId, getDownloadFileList, (text, isError) =>
         setStatus(statusEl, text, isError)
       );
-      if (uploadResult.ok) successCount += 1;
-      else failCount += 1;
+      if (uploadResult.ok) successOrders.push(meta.fileOrder);
+      else failOrders.push({ fileOrder: meta.fileOrder, reason: uploadResult.error || '업로드 시작 실패' });
     }
+
+    // 중단됐다면, 아예 손 못 댄 나머지 파일들은 사람이 보는 요약에서 "처리하지 않음"으로
+    // 표시한다(마침 다운로드 중이던 파일은 이미 자기 상태줄에 "중단됨"이 따로 떠서 여기
+    // 숫자에는 포함하지 않는다 — 예전부터의 표시 방식 그대로). 다만 파이프라인에는 그 마침
+    // 취소된 파일도 확인 신호가 절대 안 올 것이라고 알려야 하므로 반환값에는 따로 합친다.
+    const untouchedOrders = metas.slice(processed).map((meta) => ({ fileOrder: meta.fileOrder, reason: '처리되지 않음(배치 중단)' }));
+    const cancelledMidFlightOrder =
+      cancelledMidFlightFileOrder != null ? { fileOrder: cancelledMidFlightFileOrder, reason: '다운로드 중 중단됨' } : null;
+    const unconfirmableOrders =
+      cancelledMidFlightOrder != null ? [...failOrders, cancelledMidFlightOrder, ...untouchedOrders] : [...failOrders, ...untouchedOrders];
 
     runAllButton.textContent = originalLabel;
     runAllButton.disabled = false;
@@ -335,20 +526,22 @@
 
     stopButton.hidden = true;
     stopButton.onclick = null;
+    activeBatchCancelTrigger = null;
 
     if (cancelled) {
-      const untouched = metas.length - processed;
       batchStatus.textContent =
-        `중단됨: 업로드 시작 성공 ${successCount}개, 실패 ${failCount}개` +
-        (untouched > 0 ? `, 처리하지 않은 파일 ${untouched}개` : '');
+        `중단됨: 업로드 시작 성공 ${successOrders.length}개, 실패 ${failOrders.length}개` +
+        (untouchedOrders.length > 0 ? `, 처리하지 않은 파일 ${untouchedOrders.length}개` : '');
       batchStatus.classList.add('error');
     } else {
-      batchStatus.textContent = `완료: 업로드 시작 성공 ${successCount}개, 실패 ${failCount}개`;
-      batchStatus.classList.toggle('error', failCount > 0);
+      batchStatus.textContent = `완료: 업로드 시작 성공 ${successOrders.length}개, 실패 ${failOrders.length}개`;
+      batchStatus.classList.toggle('error', failOrders.length > 0);
     }
     console.log(
-      `[VodFileInfo] 모두 다운로드&업로드 ${cancelled ? '중단' : '완료'}: 성공 ${successCount} / 실패 ${failCount}`
+      `[VodFileInfo] 모두 다운로드&업로드 ${cancelled ? '중단' : '완료'}: 성공 ${successOrders.length} / 실패 ${failOrders.length}`
     );
+
+    return { successOrders, failOrders: unconfirmableOrders, cancelled };
   }
 
   function setStatus(statusEl, text, isError = false) {
@@ -510,6 +703,10 @@
         // 실제로 그 파일이 자동 첨부됐을 때만(youtubeStudio.js 쪽에서) 삭제를 시도하게 된다.
         videoId,
         fileOrder: meta.fileOrder,
+        // 다시보기 파이프라인이 돌리는 배치라면, 삭제 설정과 무관하게 Studio 쪽에서 업로드
+        // 확인 신호(vodPipeline:fileConfirmed)를 꼭 보내야 한다 — 파이프라인이 이 신호로
+        // 다음 다시보기로 넘어갈지 판단한다.
+        pipeline: pipelineUploadActive,
       });
       if (!response?.success) {
         throw new Error(response?.error || '업로드 요청을 보내지 못했습니다.');
@@ -672,6 +869,20 @@
       await downloadFile(meta, videoId, getDownloadFileList, (text, isError) => setStatus(statusEl, text, isError));
       downloadButton.disabled = false;
     });
+  }
+
+  /**
+   * "모두 다운로드&업로드" 배치가 이 파일을 다시 받을 필요가 있는지 background에 물어본다.
+   * background가 downloadedFiles 기록뿐 아니라 chrome.downloads로 실제 디스크 존재까지
+   * 재확인하므로, 사용자가 파일을 직접 지운 경우는 그냥 false로 돌아와 정상적으로 다시 받는다.
+   */
+  async function checkAlreadyDownloaded(videoId, fileOrder) {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'download:findExisting', videoId, fileOrder });
+      return response?.exists ? { exists: true, name: response.name } : { exists: false };
+    } catch (error) {
+      return { exists: false };
+    }
   }
 
   /**
