@@ -164,6 +164,11 @@ function stopCheer() {
   cheerRunner.options = null;
 }
 
+function extendCheer(seconds) {
+  if (!cheerRunner.isRunning || !Number.isFinite(seconds) || seconds <= 0) return;
+  cheerRunner.endTime += seconds * 1000;
+}
+
 function getCheerStatus() {
   const remaining = cheerRunner.isRunning
     ? Math.max(0, Math.ceil((cheerRunner.endTime - Date.now()) / 1000))
@@ -281,6 +286,11 @@ function initializeControlPanel() {
       .secondary { background: #64748b; }
       .danger { background: #dc2626; }
       .full { width: 100%; margin-top: 8px; }
+      .duration-row { justify-content: space-between; }
+      .duration-display { font-size: 16px; font-weight: bold; color: #1f2937; }
+      .button-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 7px 0; }
+      .button-grid button { padding: 6px 4px; font-size: 12px; }
+      .extend-row { margin-top: 8px; }
       .result, .status, .info { margin-top: 10px; padding: 10px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 5px; }
       .result { display: none; }
       .result img { width: 78px; height: 58px; object-fit: cover; float: left; margin-right: 9px; border-radius: 4px; }
@@ -299,13 +309,30 @@ function initializeControlPanel() {
       <div class="row"><input id="song-query" placeholder="노래 제목 또는 아티스트" /><button id="search">검색</button></div>
       <div class="row"><input id="api-key" type="password" placeholder="YouTube API Key" /><button id="save-key" class="secondary">저장</button></div>
       <div id="song-result" class="result"><img id="thumbnail" alt=""><strong id="song-title"></strong><p id="song-channel"></p><p id="song-duration"></p></div>
+      <h2>작업 시간</h2>
+      <div class="row duration-row"><label>작업 시간</label><span id="duration-display" class="duration-display">0:00</span></div>
+      <div class="button-grid">
+        <button id="dur-minus-60" class="secondary" type="button">-1분</button>
+        <button id="dur-minus-10" class="secondary" type="button">-10초</button>
+        <button id="dur-minus-1" class="secondary" type="button">-1초</button>
+        <button id="dur-plus-1" class="secondary" type="button">+1초</button>
+        <button id="dur-plus-10" class="secondary" type="button">+10초</button>
+        <button id="dur-plus-60" class="secondary" type="button">+1분</button>
+      </div>
       <h2>전송 설정</h2>
       <div class="row"><label for="emoticon">이모티콘 문자열</label><input id="emoticon" value="/응원봉2/" placeholder="/응원봉2/"></div>
       <div class="row"><label for="count">한 번에 보낼 개수</label><input id="count" type="number" min="1" max="20" value="4"></div>
       <div class="row"><label for="min-delay">최소 간격 (초)</label><input id="min-delay" type="number" min="1" step="0.1" value="1.5"></div>
       <div class="row"><label for="max-delay">최대 간격 (초)</label><input id="max-delay" type="number" min="1" step="0.1" value="2.5"></div>
       <button id="start" class="full" disabled>작업 시작</button>
-      <div id="status" class="status"><div>자동 전송 중 <span id="remaining"></span></div><div class="status-bar"><div id="progress" class="progress"></div></div><div class="status-line"><span id="elapsed">0:00</span><span id="sent">0개 전송</span></div><button id="stop" class="full danger">중지</button></div>
+      <div id="status" class="status"><div>자동 전송 중 <span id="remaining"></span></div><div class="status-bar"><div id="progress" class="progress"></div></div><div class="status-line"><span id="elapsed">0:00</span><span id="sent">0개 전송</span></div>
+        <div class="button-grid extend-row">
+          <button id="extend-1s" class="secondary" type="button">+1초</button>
+          <button id="extend-10s" class="secondary" type="button">+10초</button>
+          <button id="extend-1m" class="secondary" type="button">+1분</button>
+        </div>
+        <button id="stop" class="full danger">중지</button>
+      </div>
       <div class="row"><button id="check" class="secondary">Soop 페이지 확인</button><button id="info-button" class="secondary">정보 가져오기</button></div>
       <div id="info" class="info"></div>
       <div id="message" class="message"></div>
@@ -317,11 +344,13 @@ function initializeControlPanel() {
   const searchButton = panel('#search');
   const startButton = panel('#start');
   const status = panel('#status');
-  let songInfo = null;
   let statusTimer = null;
   let fadeTimer = null;
   let drag = null;
   let dragFrame = 0;
+  let manualDurationSeconds = 0;
+  let totalDurationSeconds = 0;
+  const MAX_DURATION_SECONDS = 24 * 60 * 60;
 
   const panelElement = panel('.panel');
   const panelHeader = panel('.panel-header');
@@ -446,14 +475,14 @@ function initializeControlPanel() {
     searchButton.disabled = true;
     try {
       const result = await new SongSearch(apiKey).searchSong(query);
-      songInfo = result;
       panel('#song-title').textContent = result.title;
       panel('#song-channel').textContent = result.channelTitle;
       panel('#song-duration').textContent = `길이: ${new SongSearch(apiKey).formatDuration(result.durationInSeconds)}`;
       panel('#thumbnail').src = result.thumbnail;
       panel('#song-result').style.display = 'block';
-      startButton.disabled = false;
-      showPanelMessage('노래를 찾았습니다.');
+      manualDurationSeconds = Math.min(MAX_DURATION_SECONDS, Math.max(0, Math.round(result.durationInSeconds)));
+      updateDurationDisplay();
+      showPanelMessage('노래를 찾았습니다. 작업 시간에 노래 길이가 적용되었습니다.');
     } catch (error) {
       showPanelMessage(`검색 실패: ${error.message}`, true);
     } finally {
@@ -462,13 +491,13 @@ function initializeControlPanel() {
   });
 
   startButton.addEventListener('click', async () => {
-    if (!songInfo) return showPanelMessage('먼저 노래를 검색해주세요.', true);
+    if (manualDurationSeconds <= 0) return showPanelMessage('작업 시간을 먼저 설정해주세요.', true);
     const options = {
       emoticon: panel('#emoticon').value.trim(),
       count: Number(panel('#count').value),
       minDelay: Number(panel('#min-delay').value) * 1000,
       maxDelay: Number(panel('#max-delay').value) * 1000,
-      duration: songInfo.durationInSeconds
+      duration: manualDurationSeconds
     };
     try {
       await saveCheerAutoSendSettings({
@@ -477,6 +506,7 @@ function initializeControlPanel() {
         minDelay: options.minDelay,
         maxDelay: options.maxDelay,
       });
+      totalDurationSeconds = manualDurationSeconds;
       const result = await startCheer(options);
       startButton.disabled = true;
       status.style.display = 'block';
@@ -487,6 +517,43 @@ function initializeControlPanel() {
       showPanelMessage(`작업 시작 실패: ${error.message}`, true);
     }
   });
+
+  function updateDurationDisplay() {
+    panel('#duration-display').textContent = formatPanelTime(manualDurationSeconds);
+    if (!cheerRunner.isRunning) {
+      startButton.disabled = manualDurationSeconds <= 0;
+    }
+  }
+
+  [
+    ['dur-minus-60', -60],
+    ['dur-minus-10', -10],
+    ['dur-minus-1', -1],
+    ['dur-plus-1', 1],
+    ['dur-plus-10', 10],
+    ['dur-plus-60', 60]
+  ].forEach(([id, delta]) => {
+    panel(`#${id}`).addEventListener('click', () => {
+      manualDurationSeconds = Math.min(MAX_DURATION_SECONDS, Math.max(0, manualDurationSeconds + delta));
+      updateDurationDisplay();
+    });
+  });
+
+  [
+    ['extend-1s', 1],
+    ['extend-10s', 10],
+    ['extend-1m', 60]
+  ].forEach(([id, seconds]) => {
+    panel(`#${id}`).addEventListener('click', () => {
+      if (!cheerRunner.isRunning) return;
+      extendCheer(seconds);
+      totalDurationSeconds += seconds;
+      updatePanelStatus(getCheerStatus());
+      showPanelMessage(`${seconds >= 60 ? seconds / 60 + '분' : seconds + '초'} 추가되었습니다.`);
+    });
+  });
+
+  updateDurationDisplay();
 
   panel('#stop').addEventListener('click', () => {
     stopCheer();
@@ -525,7 +592,7 @@ function initializeControlPanel() {
   }
 
   function updatePanelStatus(currentStatus) {
-    const duration = songInfo?.durationInSeconds || 1;
+    const duration = totalDurationSeconds || 1;
     const elapsed = Math.max(0, duration - currentStatus.remaining);
     panel('#remaining').textContent = `${formatPanelTime(currentStatus.remaining)} 남음`;
     panel('#elapsed').textContent = formatPanelTime(elapsed);
@@ -535,7 +602,7 @@ function initializeControlPanel() {
 
   function resetPanelStatus() {
     status.style.display = 'none';
-    startButton.disabled = !songInfo;
+    startButton.disabled = manualDurationSeconds <= 0;
   }
 
   function formatPanelTime(seconds) {
