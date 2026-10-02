@@ -4,10 +4,11 @@
  * 설명의 Soop 다시보기 링크로 어느 다시보기인지, 제목의 "[날짜 (n/max)]"로 몇 번째 파일인지 맞춘다
  * (매칭 규칙은 youtubeMatch.js). 파일이 하나라도 안 올라갔으면 그 다시보기는 미업로드로 본다.
  *
- * "모두 업로드" 버튼은 위 판별로 추린 미업로드 다시보기들을 background의 다시보기 파이프라인에
- * 넘긴다. 파이프라인은 다시보기 플레이어 탭 하나를 재사용해 순서대로 열며, 각 플레이어 페이지
- * (vodFileInfo.js)가 스스로 "모두 다운로드&업로드"를 돌리고, Studio 탭(youtubeStudio.js)이 각
- * 파일의 업로드 확인 신호를 보내면 그걸로 완료를 판단해 다음 다시보기로 넘어간다.
+ * "모두 업로드" 버튼은 위 판별로 추린 미업로드 다시보기들을 이 페이지 자신이 큐로 들고
+ * 하나씩 순서대로 처리한다: background에 vodBatch:start를 보내면 플레이어 탭을 그
+ * 다시보기로 열어주고, 그 페이지(vodFileInfo.js)가 "모두 다운로드&업로드"를 스스로 돌린
+ * 뒤 로컬 단계(다운로드 + Studio 업로드 요청 제출)가 끝나는 즉시 vodBatch:complete를
+ * 돌려준다 — Studio(youtubeStudio.js)의 실제 업로드 전송 확인은 기다리지 않는다.
  */
 
 (() => {
@@ -33,6 +34,86 @@
     return ids;
   }
 
+  // ---------------------------------------------------------------------------
+  // 배치 큐: 이 페이지(vodList.js) 자신이 "처리할 다시보기 목록"을 들고 순서대로 하나씩
+  // background에 vodBatch:start를 보낸다. background는 플레이어 탭을 열어 넘겨줄 뿐,
+  // 큐/진행 상태는 전부 여기(탭의 메모리)에 있다 — 그래서 이 탭이 새로고침되면 진행 중이던
+  // 배치는 복원하지 않고 그냥 끊긴다(단순함 우선, 플레이어 탭 쪽도 동일한 정책).
+  // vodFileInfo.js가 로컬 단계(다운로드 + Studio 업로드 요청 제출)를 끝내는 즉시
+  // vodBatch:complete를 보내오며, Studio의 실제 전송 확인은 기다리지 않는다. 응답 자체가
+  // 유실될 경우를 대비해 다시보기 하나당 안전망 타임아웃을 건다.
+  // ---------------------------------------------------------------------------
+  const VOD_BATCH_TIMEOUT_MS = 12 * 60 * 60 * 1000;
+  let batchQueue = [];
+  let batchDone = [];
+  let batchFailed = [];
+  let batchCurrentVideoId = null;
+  let batchTimeoutTimer = null;
+  let outEl = null;
+  let stopButtonEl = null;
+  let pipelineButtonEl = null;
+
+  function renderBatchState() {
+    const lines = [
+      batchCurrentVideoId ? `진행 중: ${batchCurrentVideoId}` : batchQueue.length > 0 ? '다음 다시보기 준비 중...' : '',
+      `남은 다시보기: ${batchQueue.length}개`,
+      `완료: ${batchDone.length}개 · 실패: ${batchFailed.length}개`,
+      batchFailed.length > 0 ? `[실패 목록]\n${batchFailed.map((f) => `${f.videoId} (${f.reason})`).join('\n')}` : '',
+    ].filter(Boolean);
+    outEl.textContent = lines.join('\n');
+  }
+
+  /** 지금 처리 중인 게 없으면 큐에서 다음 다시보기를 꺼내 시작한다. 큐가 비었으면 종료 처리. */
+  async function advanceBatchQueue() {
+    if (batchCurrentVideoId != null) return;
+    if (batchQueue.length === 0) {
+      stopButtonEl.hidden = true;
+      pipelineButtonEl.disabled = false;
+      renderBatchState();
+      console.log(`${LOG_TAG} 배치 종료 — 완료 ${batchDone.length}개, 실패 ${batchFailed.length}개`);
+      return;
+    }
+
+    const next = batchQueue.shift();
+    batchCurrentVideoId = next.videoId;
+    renderBatchState();
+
+    const res = await chrome.runtime
+      .sendMessage({ action: 'vodBatch:start', videoId: next.videoId, skipFileOrders: next.skipFileOrders })
+      .catch(() => null);
+    if (!res?.success) {
+      batchFailed.push({ videoId: next.videoId, reason: '배치 시작 요청 실패' });
+      batchCurrentVideoId = null;
+      advanceBatchQueue();
+      return;
+    }
+
+    clearTimeout(batchTimeoutTimer);
+    batchTimeoutTimer = setTimeout(() => {
+      console.warn(`${LOG_TAG} ${next.videoId} 완료 응답 시간 초과 — 실패로 치고 다음으로 진행`);
+      batchFailed.push({ videoId: next.videoId, reason: '시간 초과' });
+      batchCurrentVideoId = null;
+      advanceBatchQueue();
+    }, VOD_BATCH_TIMEOUT_MS);
+  }
+
+  chrome.runtime.onMessage.addListener((request) => {
+    if (request?.action !== 'vodBatch:complete') return;
+    if (request.videoId !== batchCurrentVideoId) return; // 이미 시간 초과 등으로 처리된 옛 응답
+    clearTimeout(batchTimeoutTimer);
+    batchCurrentVideoId = null;
+    const failOrders = Array.isArray(request.failOrders) ? request.failOrders : [];
+    if (request.cancelled) {
+      batchFailed.push({ videoId: request.videoId, reason: '중단됨' });
+    } else if (failOrders.length > 0) {
+      batchFailed.push({ videoId: request.videoId, reason: `${failOrders.length}개 파일 실패` });
+    } else {
+      batchDone.push(request.videoId);
+    }
+    renderBatchState();
+    advanceBatchQueue();
+  });
+
   function mountButton() {
     if (document.getElementById(HOST_ID)) return;
     const host = document.createElement('div');
@@ -45,8 +126,6 @@
         button{padding:8px 12px;border:0;border-radius:6px;background:#3b5bdb;color:#fff;cursor:pointer}
         button:disabled{opacity:.6;cursor:default}
         #pipeline-btn{background:#16a34a}
-        #pause-btn{background:#d97706}
-        #pause-btn[hidden]{display:none}
         #stop-btn{background:#dc2626}
         #stop-btn[hidden]{display:none}
         pre{margin:6px 0 0;max-width:420px;max-height:320px;overflow:auto;padding:8px;background:#fff;
@@ -55,15 +134,16 @@
       <div class="row">
         <button id="check-btn">유튜브 업로드 여부 확인</button>
         <button id="pipeline-btn">모두 업로드</button>
-        <button id="pause-btn" hidden>일시정지</button>
         <button id="stop-btn" hidden>중단</button>
       </div>
       <pre hidden></pre>`;
     const checkButton = shadow.getElementById('check-btn');
     const pipelineButton = shadow.getElementById('pipeline-btn');
-    const pauseButton = shadow.getElementById('pause-btn');
     const stopButton = shadow.getElementById('stop-btn');
     const out = shadow.querySelector('pre');
+    outEl = out;
+    stopButtonEl = stopButton;
+    pipelineButtonEl = pipelineButton;
 
     checkButton.addEventListener('click', async () => {
       checkButton.disabled = true;
@@ -87,114 +167,37 @@
         const { pending } = await checkMatch();
         if (pending.length === 0) {
           out.textContent = '이 페이지의 다시보기가 모두 이미 업로드돼 있습니다.';
+          pipelineButton.disabled = false;
           return;
         }
         // checkMatch()가 이미 파일 단위로 유튜브 업로드 여부를 판별해뒀다(vod.files[].uploaded,
         // fileOrder 포함) — 다시보기 전체가 미완료(pending)라도 그중 일부 파일은 이미 올라가
-        // 있을 수 있으므로, 배치가 그 파일까지 다시 올리지 않도록 videoId별로 넘겨준다.
-        const alreadyUploaded = {};
-        for (const vod of pending) {
-          const orders = (vod.files || []).filter((f) => f.uploaded).map((f) => f.fileOrder);
-          if (orders.length > 0) alreadyUploaded[vod.videoId] = orders;
-        }
-        const res = await chrome.runtime.sendMessage({
-          action: 'vodPipeline:start',
-          videoIds: pending.map((v) => v.videoId),
-          alreadyUploaded,
-        });
-        if (!res?.success) throw new Error(res?.error || '파이프라인 시작 실패');
-        console.log(`${LOG_TAG} 파이프라인 시작: ${res.total}개`, pending.map((v) => v.videoId));
-        startWatchingProgress(out, pauseButton, stopButton, pipelineButton);
+        // 있을 수 있으므로, 배치가 그 파일까지 다시 올리지 않도록 다시보기별로 넘겨준다.
+        batchQueue = pending.map((vod) => ({
+          videoId: vod.videoId,
+          skipFileOrders: (vod.files || []).filter((f) => f.uploaded).map((f) => f.fileOrder),
+        }));
+        batchDone = [];
+        batchFailed = [];
+        console.log(`${LOG_TAG} 배치 시작: ${batchQueue.length}개`, batchQueue.map((v) => v.videoId));
+        stopButton.hidden = false;
+        stopButton.disabled = false;
+        stopButton.textContent = '중단';
+        advanceBatchQueue();
       } catch (error) {
         out.textContent = `실패: ${error.message}`;
         pipelineButton.disabled = false;
       }
     });
 
-    // 일시정지/재개 — 중단과 달리 진행 상황을 그대로 두고, 다음 파일/다음 다시보기로
-    // 넘어가는 것만 멈춘다. 이미 시작된 다운로드/업로드/Studio 자동화는 그대로 진행된다.
-    pauseButton.addEventListener('click', async () => {
-      const isPaused = pauseButton.dataset.paused === '1';
-      pauseButton.disabled = true;
-      const res = await chrome.runtime
-        .sendMessage({ action: isPaused ? 'vodPipeline:resume' : 'vodPipeline:pause' })
-        .catch(() => null);
-      if (!res?.success) {
-        console.warn(`${LOG_TAG} 일시정지/재개 요청 실패`, res?.error);
-      }
-      pauseButton.disabled = false;
-      // 버튼 라벨 자체는 다음 vodPipeline:status 폴링(최대 3초 이내)에서 실제 상태 기준으로
-      // 갱신된다 — 여기서 낙관적으로 바꾸지 않아, 요청이 실패해도 화면이 어긋나지 않는다.
-    });
-
     stopButton.addEventListener('click', async () => {
       stopButton.disabled = true;
       stopButton.textContent = '중단하는 중...';
-      await chrome.runtime.sendMessage({ action: 'vodPipeline:stop' }).catch(() => {});
+      batchQueue = []; // 아직 시작하지 않은 나머지 다시보기는 더 이상 진행하지 않는다
+      await chrome.runtime.sendMessage({ action: 'vodBatch:cancel' }).catch(() => {});
     });
 
     document.body.appendChild(host);
-
-    // 페이지를 새로고침해도 이미 돌고 있던 파이프라인이 있으면 진행 상황을 이어서 보여준다.
-    chrome.runtime.sendMessage({ action: 'vodPipeline:status' }).then((res) => {
-      if (res?.state?.running) {
-        out.hidden = false;
-        pipelineButton.disabled = true;
-        startWatchingProgress(out, pauseButton, stopButton, pipelineButton);
-      }
-    });
-  }
-
-  /** vodPipeline:status를 주기적으로 물어 진행 상황을 보여주고, 끝나면 버튼을 되돌린다. */
-  function startWatchingProgress(out, pauseButton, stopButton, pipelineButton) {
-    pauseButton.hidden = false;
-    pauseButton.disabled = false;
-    setPauseButtonState(pauseButton, false);
-    stopButton.hidden = false;
-    stopButton.disabled = false;
-    stopButton.textContent = '중단';
-
-    const timer = setInterval(async () => {
-      const res = await chrome.runtime.sendMessage({ action: 'vodPipeline:status' }).catch(() => null);
-      const state = res?.state;
-      if (!state || !state.running) {
-        clearInterval(timer);
-        pauseButton.hidden = true;
-        stopButton.hidden = true;
-        pipelineButton.disabled = false;
-        if (state) {
-          out.textContent = `파이프라인 종료 — 완료 ${state.done.length}개, 실패 ${state.failed.length}개\n` + formatPipelineState(state);
-        }
-        return;
-      }
-      setPauseButtonState(pauseButton, Boolean(state.paused));
-      out.textContent = formatPipelineState(state);
-    }, 3000);
-  }
-
-  /** 실제 상태(paused) 기준으로 버튼 라벨/동작을 맞춘다 — 요청 성공 여부와 무관하게 항상 진짜 상태를 따라간다. */
-  function setPauseButtonState(pauseButton, paused) {
-    pauseButton.dataset.paused = paused ? '1' : '0';
-    pauseButton.textContent = paused ? '재개' : '일시정지';
-  }
-
-  function formatPipelineState(state) {
-    const cur = state.current;
-    const curLine = cur
-      ? `진행 중: ${cur.videoId}` +
-        (Array.isArray(cur.fileOrders)
-          ? ` (파일 확인 ${cur.confirmedFileOrders.length + cur.failedFileOrders.length}/${cur.fileOrders.length})`
-          : ' (파일 목록 불러오는 중)')
-      : '다음 다시보기 준비 중...';
-    return [
-      state.paused ? '⏸ 일시정지됨 (진행 중인 다운로드/업로드는 그대로 끝까지 진행되고, 다음 단계부터 멈춰 있습니다)' : '',
-      curLine,
-      `남은 다시보기: ${state.queue.length}개`,
-      `완료: ${state.done.length}개 · 실패: ${state.failed.length}개`,
-      state.failed.length > 0 ? `[실패 목록]\n${state.failed.map((f) => `${f.videoId} (${f.reason})`).join('\n')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n');
   }
 
   function formatVod(vod) {

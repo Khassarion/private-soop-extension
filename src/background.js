@@ -115,23 +115,113 @@ async function setMonitoredTabs(monitoredTabs) {
   await chrome.storage.session.set({ monitoredTabs });
 }
 
-// YouTube Studio 업로드 창을 열면서 미리 채워줄 제목/설명을 탭별로 보관한다.
-// (여러 파일의 업로드 탭을 연달아 열어도 서로 섞이지 않도록 tabId로 구분)
+/** 탭의 content script에 메시지를 보내되, 응답이 없거나 실패하면 null (멈춰버리지 않도록 타임아웃) */
+function sendToTab(tabId, message, timeoutMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    chrome.tabs
+      .sendMessage(tabId, message)
+      .then((response) => {
+        clearTimeout(timer);
+        resolve(response ?? null);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 탭 하나를 열어두고 재사용하면서 메시지를 "확실히" 전달하는 공용 로직. Studio 탭(업로드
+// 자동화)과 다시보기 플레이어 탭(배치) 둘 다 "탭을 하나만 두고 계속 재사용"하는 같은
+// 정책을 쓰므로 이 두 함수로 통일한다. 큐/바쁜지 확인(probe) 같은 건 없다 — 받는 쪽
+// content script가 자기 몫의 순서 관리(요청 큐)를 스스로 하기 때문에, 여기서는 "탭이
+// 있는지, 로드가 끝났는지"만 신경 쓰면 된다.
+// ---------------------------------------------------------------------------
+
+/** 탭이 막 생성/네비게이션된 직후엔 content script가 아직 리스너를 안 걸었을 수 있어, 로드
+ *  완료(status: 'complete')까지 기다린 뒤에 메시지를 보낸다. 완료 신호를 놓칠 경우를 대비해
+ *  타임아웃도 둔다. */
+function waitForTabLoad(tabId, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve();
+    };
+    const listener = (updatedTabId, info) => {
+      if (updatedTabId === tabId && info.status === 'complete') finish();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (tab.status === 'complete') finish();
+      })
+      .catch(finish);
+    const timer = setTimeout(finish, timeoutMs);
+  });
+}
+
+/** 로드 완료 직후에도 content script 등록에 약간의 지연이 있을 수 있어, 전송 자체도 몇 차례
+ *  재시도한다(짧은 간격으로). */
+async function sendWithRetry(tabId, message, attempts = 8, intervalMs = 400) {
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      await chrome.tabs.sendMessage(tabId, message);
+      return true;
+    } catch (error) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+  }
+  return false;
+}
+
+/**
+ * 저장해둔 tabId가 있으면(존재 확인 후) 그대로 쓰고, 없으면 새로 열어 저장한다.
+ * `navigateIfExists`가 true면 이미 있는 탭도 매번 그 url로 이동시킨다(다시보기 플레이어
+ * 탭처럼 "다음 작업 대상"이 바뀌는 경우). false면 한 번 연 뒤로는 그대로 둔다(Studio 탭처럼
+ * 같은 페이지에 여러 요청을 계속 흘려보내는 경우 — 매번 새로고침하면 그때마다 처리 중이던
+ * 자동화가 끊긴다). 새로 열거나 이동시킨 경우에만 로드 완료를 기다린다.
+ */
+async function ensureTabAt(getTabId, setTabId, url, { navigateIfExists = false } = {}) {
+  let tabId = await getTabId();
+  if (tabId != null) {
+    try {
+      await chrome.tabs.get(tabId);
+    } catch (error) {
+      tabId = null;
+      await setTabId(null);
+    }
+  }
+
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({ url, active: true });
+    await setTabId(tab.id);
+    await waitForTabLoad(tab.id);
+    return tab.id;
+  }
+
+  if (navigateIfExists) {
+    await chrome.tabs.update(tabId, { url, active: true });
+    await waitForTabLoad(tabId);
+  }
+  return tabId;
+}
+
+// ---------------------------------------------------------------------------
+// YouTube Studio 업로드 자동화 탭. 탭은 하나만 두고 계속 재사용한다(여러 개면 백그라운드
+// 탭이 돼 렌더링/타이머가 느려지면서 자동화 버튼이 안 뜨는 문제가 실제로 있었다). 업로드
+// 요청의 순서 관리(큐)는 youtubeStudio.js 쪽에서 전담하므로, 여기서는 그 탭 하나에 요청을
+// 확실히 전달하는 것까지만 책임진다 — "지금 바쁜지" 확인(probe)이나 재시작 요청 같은 건 없다.
+// ---------------------------------------------------------------------------
 const STUDIO_LOG_TAG = '[YoutubeStudio]';
 const YOUTUBE_UPLOAD_PAGE_URL = 'https://www.youtube.com/upload';
 
-async function getPendingStudioUploads() {
-  const { pendingStudioUploads } = await chrome.storage.session.get(['pendingStudioUploads']);
-  return pendingStudioUploads || {};
-}
-
-async function setPendingStudioUploads(pendingStudioUploads) {
-  await chrome.storage.session.set({ pendingStudioUploads });
-}
-
-// 업로드 탭은 딱 하나만 두고 무조건 재사용한다(탭이 여러 개면 백그라운드 탭이 돼 렌더링/타이머가
-// 느려지면서 자동화 버튼이 안 뜨는 문제가 있었다). 처리하지 못한 요청은 큐에 쌓아두고, 탭이
-// 준비되는 대로(재사용 성공, 새로고침 후 재접속, 다음 알람 등) 순서대로 하나씩 배정한다.
 async function getStudioTabId() {
   const { studioTabId } = await chrome.storage.session.get(['studioTabId']);
   return studioTabId ?? null;
@@ -141,35 +231,17 @@ async function setStudioTabId(studioTabId) {
   await chrome.storage.session.set({ studioTabId });
 }
 
-async function getStudioUploadQueue() {
-  const { studioUploadQueue } = await chrome.storage.session.get(['studioUploadQueue']);
-  return studioUploadQueue || [];
-}
+/** 업로드 요청 하나를 Studio 탭에 전달한다. 실패하면(탭이 죽어있었던 경우 등) 탭을 완전히
+ *  새로 열어 한 번 더 시도한다. */
+async function deliverStudioRequest(payload) {
+  let tabId = await ensureTabAt(getStudioTabId, setStudioTabId, YOUTUBE_UPLOAD_PAGE_URL, { navigateIfExists: false });
+  let delivered = await sendWithRetry(tabId, { action: 'studio:newRequest', payload });
+  if (delivered) return;
 
-async function setStudioUploadQueue(studioUploadQueue) {
-  await chrome.storage.session.set({ studioUploadQueue });
-}
-
-/** Studio 탭의 content script에 전달할 데이터(제목/설명/파일 후보/저장된 옵션)를 만든다. */
-async function buildStudioPayload(entry) {
-  const { vodFileInfo } = (await getSettings()).features;
-  return {
-    title: entry.title,
-    description: entry.description,
-    fileNames: entry.fileNames || [],
-    // 자동 첨부가 실제로 성공했을 때만(=어느 로컬 파일인지 확실할 때만) "업로드 확인 후 삭제"를
-    // 시도할 수 있어야 하므로, 그 파일을 정확히 지칭할 videoId/fileOrder를 같이 넘겨준다.
-    videoId: entry.videoId ?? null,
-    fileOrder: entry.fileOrder ?? null,
-    downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
-    options: {
-      visibility: vodFileInfo.youtubeVisibility,
-      notForKids: vodFileInfo.youtubeNotForKids,
-      playlists: vodFileInfo.youtubePlaylists,
-      deleteAfterUpload: vodFileInfo.deleteLocalFileAfterUpload,
-      pipeline: Boolean(entry.pipeline),
-    },
-  };
+  console.warn(`${STUDIO_LOG_TAG} 요청 전달 실패 — 탭을 새로 열어 재시도`);
+  await setStudioTabId(null);
+  tabId = await ensureTabAt(getStudioTabId, setStudioTabId, YOUTUBE_UPLOAD_PAGE_URL, { navigateIfExists: false });
+  await sendWithRetry(tabId, { action: 'studio:newRequest', payload });
 }
 
 /** 유튜브 Studio 탭을 통해 내 채널의 업로드 영상 목록을 가져온다. 열린 Studio 탭이 없으면 잠깐 열었다 닫는다. */
@@ -198,235 +270,60 @@ async function fetchYoutubeVideos() {
   }
 }
 
-/** 탭의 content script에 메시지를 보내되, 응답이 없거나 실패하면 null (멈춰버리지 않도록 타임아웃) */
-function sendToTab(tabId, message, timeoutMs) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), timeoutMs);
-    chrome.tabs
-      .sendMessage(tabId, message)
-      .then((response) => {
-        clearTimeout(timer);
-        resolve(response ?? null);
-      })
-      .catch(() => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-  });
-}
-
-// 재사용 실패(탭은 idle로 보이는데 자동화가 안 먹힌 경우) 후 새로고침을 다시 시도하기까지
-// 최소 간격 — 새로고침이 beforeunload 확인 창에 막히는 상황에서 매번 새 확인 창을 계속
-//띄워 사용자를 귀찮게 하지 않기 위함.
-const STUDIO_RELOAD_COOLDOWN_MS = 3 * 60 * 1000;
-let lastStudioReloadAttemptAt = 0;
-let studioQueueDraining = false;
-
-/**
- * 업로드 대기열을 앞에서부터 순서대로 처리한다. 재사용할 탭이 없으면(맨 처음, 또는 탭이
- * 닫혔으면) 이번 한 번만 새로 열고, 그 뒤로는 그 탭만 계속 재사용한다 — 탭을 여러 개
- * 띄우면 백그라운드 탭이 돼 렌더링/타이머가 느려지면서 자동화가 실패하는 문제가 있었다.
- * 탭이 idle로 보이는데(probe: reusable) 실제 재시작이 실패하면(아마 같은 이유로 버튼이
- * 아직 안 뜬 상태) 새로고침으로 복구를 시도한다. 새로고침 자체가 막히면(업로드 중이라
- * 나가기 확인 창이 뜨는 경우) 큐는 그대로 두고 물러난다 — 사용자가 그 확인 창을 해결해
- * 탭이 다시 로드되면 그 탭의 content script가 init()으로 큐 맨 앞 항목을 스스로 받아간다.
- */
-async function drainStudioQueue() {
-  if (studioQueueDraining) return;
-  studioQueueDraining = true;
-  try {
-    for (;;) {
-      const queue = await getStudioUploadQueue();
-      if (queue.length === 0) break;
-      const entry = queue[0];
-
-      let tabId = await getStudioTabId();
-      if (tabId != null) {
-        try {
-          await chrome.tabs.get(tabId);
-        } catch (error) {
-          tabId = null;
-          await setStudioTabId(null);
-        }
-      }
-
-      if (tabId == null) {
-        const tab = await chrome.tabs.create({ url: YOUTUBE_UPLOAD_PAGE_URL, active: true });
-        await setStudioTabId(tab.id);
-        const pending = await getPendingStudioUploads();
-        pending[tab.id] = entry;
-        await setPendingStudioUploads(pending);
-        await setStudioUploadQueue(queue.slice(1));
-        console.log(`${STUDIO_LOG_TAG} 새 Studio 탭 생성 (tabId=${tab.id}), 제목: ${entry.title}`);
-        continue;
-      }
-
-      const payload = await buildStudioPayload(entry);
-      const probe = await sendToTab(tabId, { action: 'youtubeStudio:probe' }, 2000);
-      if (!probe?.reusable) break; // 아직 바쁨(정상) — 나중에(becameIdle/새 요청/알람) 다시 시도
-
-      const result = await sendToTab(tabId, { action: 'youtubeStudio:restart', payload }, 25000);
-      if (result?.started) {
-        const pending = await getPendingStudioUploads();
-        pending[tabId] = entry; // 탭이 새로고침돼도 최신 업로드 데이터로 이어지게 갱신
-        await setPendingStudioUploads(pending);
-        await chrome.tabs.update(tabId, { active: true });
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          await chrome.windows.update(tab.windowId, { focused: true });
-        } catch (error) {
-          // 포커스만 실패한 것 — 업로드 자체는 이미 시작됐으니 무시
-        }
-        await setStudioUploadQueue(queue.slice(1));
-        console.log(`${STUDIO_LOG_TAG} 기존 Studio 탭 재사용 (tabId=${tabId}), 제목: ${entry.title}`);
-        continue;
-      }
-
-      console.warn(`${STUDIO_LOG_TAG} 탭이 idle로 보이는데 재사용 실패(${result?.reason || '응답 없음'}) — 새로고침으로 복구 시도`);
-      const now = Date.now();
-      if (now - lastStudioReloadAttemptAt < STUDIO_RELOAD_COOLDOWN_MS) break;
-      lastStudioReloadAttemptAt = now;
-      try {
-        await chrome.tabs.reload(tabId);
-      } catch (error) {
-        console.warn(`${STUDIO_LOG_TAG} 탭 새로고침 요청 실패:`, error.message);
-      }
-      // 큐는 건드리지 않고 물러난다. 새로고침이 실제로 진행됐다면 그 탭이 다시 뜬 뒤
-      // youtubeStudio:init에서 큐 맨 앞 항목을 스스로 받아간다(아래 핸들러 참고). 업로드
-      // 중이라 확인 창에 막혔다면 사용자가 해결한 뒤 같은 방식으로 이어진다.
-      break;
-    }
-  } finally {
-    studioQueueDraining = false;
-  }
-}
-
 // ---------------------------------------------------------------------------
-// 다시보기 파이프라인: 다시보기 목록 페이지의 "모두 업로드"가 시작한다. 목록 페이지
-// (vodList.js) → 다시보기 플레이어 페이지(vodFileInfo.js) → Studio 탭(youtubeStudio.js)
-// 세 종류의 content script가 이 background를 거쳐 순서대로 이어진다:
-//   1. 목록 페이지가 (이미 있던 업로드 여부 확인 기능으로) 미업로드 다시보기 id 목록을 추려
-//      vodPipeline:start로 넘긴다.
-//   2. 여기서 그 큐를 하나씩 꺼내 플레이어 탭을 그 다시보기로 옮기고(탭은 하나만 재사용),
-//      vodFileInfo.js가 로드되면서 vodPipeline:initPlayer로 "내가 지금 그 대상이냐" 물으면
-//      맞다고 답해준다. 그러면 플레이어 페이지가 스스로 "모두 다운로드&업로드"를 돌리고,
-//      각 파일의 fileOrder 목록(vodPipeline:filesTotal)과 로컬 단계에서 이미 실패한 파일
-//      (vodPipeline:localBatchDone)을 알려준다.
-//   3. 업로드된 파일은 Studio 탭에서 공개 상태 확인이 끝나는 시점(watchUploadAndDelete)에
-//      vodPipeline:fileConfirmed로 알려온다.
-//   4. 한 다시보기의 모든 fileOrder가 확인(성공 또는 로컬 실패)됐으면 다음 다시보기로 넘어간다.
-// 어느 파일이 계속 응답이 없으면(버그, 네트워크 문제 등) VOD_PIPELINE_TIMEOUT_MS를 넘긴
-// 시점에 그 다시보기를 실패로 두고 다음으로 넘어간다 — 파이프라인 전체가 영원히 멈추지
-// 않도록 하는 안전망이다.
+// 다시보기 배치: 다시보기 목록 페이지(vodList.js)가 미업로드 다시보기들을 순서대로 하나씩
+// 맡긴다. 큐(어떤 다시보기를 언제 처리할지)는 vodList.js 자신이 들고 돈다 — background는
+// "플레이어 탭 하나를 그 다시보기로 열어주고, 끝나면 결과를 돌려주는" 중계만 한다.
+//   1. vodList.js → background: vodBatch:start {videoId, skipFileOrders}
+//   2. background가 플레이어 탭을 그 videoId로 열거나 이동시키고 vodBatch:begin 전달
+//   3. vodFileInfo.js가 로컬 단계(다운로드+Studio 업로드 요청)를 끝내자마자(Studio 쪽 실제
+//      전송 확인은 기다리지 않음) vodBatch:complete를 background로 보냄
+//   4. background가 그 요청을 보냈던 탭(vodList.js)에 그대로 전달 + 실패 있으면 기록/알림
 // ---------------------------------------------------------------------------
-const VOD_PIPELINE_LOG_TAG = '[VodPipeline]';
 const VOD_PLAYER_URL_PREFIX = 'https://vod.sooplive.com/player/';
-// 다시보기 하나에 파일이 여러 개면 업로드 확인까지 꽤 걸릴 수 있어 넉넉하게 잡는다. 이
-// 시간을 넘기면 응답 없는 파일이 있다고 보고 그 다시보기를 포기한 뒤 다음으로 넘어간다.
-const VOD_PIPELINE_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 
-async function getVodPipeline() {
-  const { vodPipeline } = await chrome.storage.session.get(['vodPipeline']);
-  return vodPipeline || null;
+async function getPlayerTabId() {
+  const { playerTabId } = await chrome.storage.session.get(['playerTabId']);
+  return playerTabId ?? null;
 }
 
-async function setVodPipeline(vodPipeline) {
-  await chrome.storage.session.set({ vodPipeline });
+async function setPlayerTabId(playerTabId) {
+  await chrome.storage.session.set({ playerTabId });
 }
 
-async function getPipelineTabId() {
-  const { pipelineTabId } = await chrome.storage.session.get(['pipelineTabId']);
-  return pipelineTabId ?? null;
+/** 지금 진행 중인 배치를 요청한 vodList.js 탭 — 완료 알림을 돌려줄 곳. 동시에 하나의
+ *  다시보기만 처리하므로(vodList.js가 순서대로 하나씩 보냄) 단일 슬롯으로 충분하다. */
+async function getVodBatchRequest() {
+  const { vodBatchRequest } = await chrome.storage.session.get(['vodBatchRequest']);
+  return vodBatchRequest || null;
 }
 
-async function setPipelineTabId(pipelineTabId) {
-  await chrome.storage.session.set({ pipelineTabId });
-}
-
-// ---------------------------------------------------------------------------
-// "삭제 대기 중"인 파일 추적. Studio 탭(youtubeStudio.js)의 watchUploadAndDelete가 삭제를
-// 시도할 파일 하나를 감시하기 시작/끝낼 때마다 vodPipeline:deletionPendingChanged로 알려온다.
-// 이 목록이 너무 길어지면(디스크에 아직 안 지워진 파일이 쌓이는 중이라는 뜻) 다시보기
-// 파이프라인의 "지름길"(canFastForwardVod) 진행이 다운로드 속도를 업로드 확인 속도보다
-// 훨씬 앞지르고 있다는 신호이므로, 배치를 잠깐 멈춰 Studio가 따라잡을 시간을 준다.
-// ---------------------------------------------------------------------------
-const PENDING_DELETION_PAUSE_THRESHOLD = 10; // 이상이면 자동 일시정지
-const PENDING_DELETION_RESUME_THRESHOLD = 9; // 이하로 내려오면 자동 재개(문턱을 갈라 잦은 토글 방지)
-
-async function getPendingDeletions() {
-  const { pendingDeletions } = await chrome.storage.session.get(['pendingDeletions']);
-  return pendingDeletions || [];
-}
-
-async function setPendingDeletions(list) {
-  await chrome.storage.session.set({ pendingDeletions: list });
-}
-
-/** 지금 관리 중인 Studio 탭에 최신 삭제 대기 목록을 보내 패널에 표시하게 한다(실패해도 무해). */
-async function notifyPendingDeletionsToTab(list) {
-  const tabId = await getStudioTabId();
-  if (tabId == null) return;
-  sendToTab(tabId, { action: 'vodPipeline:pendingDeletionsUpdated', deletions: list }, 2000);
-}
-
-/**
- * `paused`(사용자 일시정지) 또는 `throttled`(삭제 대기 과다로 인한 자동 일시정지) 중 하나를
- * 켜거나 끈다. 실제로 "멈춰 있는" 상태는 두 플래그의 OR이므로, 한쪽이 이미 켜져 있는데
- * 다른 쪽을 또 켜는 건 아무 효과가 없고(멱등), 완전히 재개되는 건 둘 다 꺼졌을 때뿐이다.
- * 일시정지 구간 동안 흐른 시간은 VOD_PIPELINE_TIMEOUT_MS 판정에서 빼줘야 하므로(그렇지
- * 않으면 오래 멈췄다가 풀리는 순간 시간 초과로 오판할 수 있다), `pausedAt`은 두 플래그
- * 중 아무것도 안 켜진 상태에서 처음 켜질 때만 기록하고, 둘 다 꺼져야만 그 구간만큼
- * `current.startedAt`을 밀어주고 지운다.
- */
-async function setPipelinePauseFlag(flagName, value) {
-  const state = await getVodPipeline();
-  if (!state?.running) return { success: false, error: '실행 중인 파이프라인이 없습니다.' };
-
-  const wasPaused = Boolean(state.paused) || Boolean(state.throttled);
-  state[flagName] = value;
-  const isPausedNow = Boolean(state.paused) || Boolean(state.throttled);
-
-  if (isPausedNow && !wasPaused) {
-    state.pausedAt = Date.now();
-  } else if (!isPausedNow && wasPaused && state.pausedAt != null) {
-    if (state.current) state.current.startedAt += Date.now() - state.pausedAt;
-    state.pausedAt = null;
-  }
-
-  await setVodPipeline(state);
-  console.log(`${VOD_PIPELINE_LOG_TAG} ${flagName}=${value} (${isPausedNow ? '정지' : '진행'})`);
-  if (state.current?.tabId != null) {
-    sendToTab(state.current.tabId, { action: 'vodPipeline:setPaused', paused: isPausedNow }, 2000);
-  }
-  if (!isPausedNow && wasPaused) advanceVodPipeline();
-  return { success: true };
+async function setVodBatchRequest(vodBatchRequest) {
+  await chrome.storage.session.set({ vodBatchRequest });
 }
 
 // ---------------------------------------------------------------------------
-// 파이프라인 실패 기록: 파일 하나 또는 다시보기 하나가 실패하면 반드시 사용자가 알 수
-// 있어야 한다 — 콘솔 로그(이미 각 실패 지점에서 찍는다) 외에, (1) chrome.storage.local에
-// 남는 영구 히스토리(세션이 끝나거나 브라우저를 재시작해도 남는다 — vodPipeline 자체는
-// storage.session이라 그때 사라짐)와 (2) chrome.notifications 데스크톱 알림 두 가지를
-// 더한다. 알림 아이콘은 별도 이미지 파일 없이 작은 빨간 원을 데이터 URL로 인라인했다.
+// 실패 기록: 파일 하나가 실패하면 반드시 사용자가 알 수 있어야 한다 — 콘솔 로그 외에
+// (1) chrome.storage.local에 남는 영구 히스토리와 (2) chrome.notifications 데스크톱 알림
+// 두 가지를 더한다. 알림 아이콘은 별도 이미지 파일 없이 작은 빨간 원을 데이터 URL로
+// 인라인했다.
 // ---------------------------------------------------------------------------
+const VOD_BATCH_LOG_TAG = '[VodBatch]';
 const PIPELINE_FAILURE_HISTORY_MAX = 200;
 const PIPELINE_FAILURE_ICON_DATA_URL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAbklEQVR4nO3UwQ0AIAgEQauh/4LsRQtQiQgHGrmE986LUl5bJWrchUShmNO4GqENqyDWcRECFd9GhALQcRbhFV8i/gZ4xwdEAhKQgHBA+CNKgDdiGvdCsPErAEjEVhyFEMUtIcdhC4RJXIqBRJHrRq8Fb3n0ggwAAAAASUVORK5CYII=';
 
 function formatPipelineFailureMessage(entry) {
-  if (entry.type === 'vod') {
-    return `다시보기 ${entry.videoId} 처리 실패: ${entry.reason}`;
-  }
   return `다시보기 ${entry.videoId}의 파일(${entry.fileOrder}번) 실패: ${entry.reason}`;
 }
 
 /**
  * 실패 하나를 영구 히스토리에 남기고(chrome.storage.local, 최대 200개 — 오래된 것부터
- * 버림), 데스크톱 알림을 띄운다. entry: { type: 'vod' | 'file', videoId, fileOrder?, reason }.
+ * 버림), 데스크톱 알림을 띄운다. entry: { videoId, fileOrder, reason }.
  */
 async function recordPipelineFailure(entry) {
   const record = { at: Date.now(), ...entry };
-  console.warn(`${VOD_PIPELINE_LOG_TAG} 실패 기록:`, record);
+  console.warn(`${VOD_BATCH_LOG_TAG} 실패 기록:`, record);
 
   try {
     const { pipelineFailureHistory = [] } = await chrome.storage.local.get(['pipelineFailureHistory']);
@@ -434,150 +331,19 @@ async function recordPipelineFailure(entry) {
     while (pipelineFailureHistory.length > PIPELINE_FAILURE_HISTORY_MAX) pipelineFailureHistory.shift();
     await chrome.storage.local.set({ pipelineFailureHistory });
   } catch (error) {
-    console.warn(`${VOD_PIPELINE_LOG_TAG} 실패 히스토리 저장 오류:`, error.message);
+    console.warn(`${VOD_BATCH_LOG_TAG} 실패 히스토리 저장 오류:`, error.message);
   }
 
   try {
     await chrome.notifications.create('', {
       type: 'basic',
       iconUrl: PIPELINE_FAILURE_ICON_DATA_URL,
-      title: '다시보기 파이프라인 실패',
+      title: '다시보기 배치 실패',
       message: formatPipelineFailureMessage(record),
       priority: 1,
     });
   } catch (error) {
-    console.warn(`${VOD_PIPELINE_LOG_TAG} 알림 생성 실패:`, error.message);
-  }
-}
-
-/** 이 다시보기의 모든 파일이 확인(업로드 확인 또는 로컬 단계 실패)됐는지. */
-function isCurrentVodSettled(current) {
-  if (!current || !Array.isArray(current.fileOrders)) return false;
-  const settled = new Set([...current.confirmedFileOrders, ...current.failedFileOrders]);
-  return current.fileOrders.every((fo) => settled.has(fo));
-}
-
-/**
- * 지금까지 이 파이프라인 실행(run)에서 실패 기록이 하나도 없었다면, Studio가 각 파일의
- * 공개 상태 전환을 다 확인해줄 때까지 기다리지 않고 "마지막 파일까지 다운로드해서 Studio
- * 쪽에 업로드 요청까지 마쳤다"(localBatchDone)는 시점만으로 다음 다시보기로 넘어간다.
- * 지금까지 순조로웠다는 뜻이니 Studio 큐를 믿고 속도를 낸다 — 반대로 실패가 하나라도
- * 나온 뒤에는(이 다시보기 자신의 로컬 실패 포함) 이 지름길을 쓰지 않고 원래대로 전부
- * 확인될 때까지(또는 시간 초과) 기다린다. 이미 완전히 확인된 경우까지 굳이 이 지름길을
- * 타지 않도록 isCurrentVodSettled를 먼저 본다.
- */
-function canFastForwardVod(state) {
-  return Boolean(state.current?.localBatchDone) && !state.hasFailures && !isCurrentVodSettled(state.current);
-}
-
-/** 플레이어 탭을 하나만 두고 재사용한다(Studio 탭과 같은 이유 — 여러 개 띄우지 않는다). */
-async function ensurePipelineTab(videoId) {
-  const url = `${VOD_PLAYER_URL_PREFIX}${videoId}`;
-  let tabId = await getPipelineTabId();
-  if (tabId != null) {
-    try {
-      await chrome.tabs.get(tabId);
-    } catch (error) {
-      tabId = null;
-    }
-  }
-  if (tabId == null) {
-    const tab = await chrome.tabs.create({ url, active: true });
-    await setPipelineTabId(tab.id);
-    return tab.id;
-  }
-  await chrome.tabs.update(tabId, { url, active: true });
-  return tabId;
-}
-
-let vodPipelineAdvancing = false;
-
-/**
- * 파이프라인 큐를 한 단계 진행한다. 지금 처리 중인 다시보기가 다 끝났으면(또는 시간
- * 초과됐으면) 다음 것으로 넘어가고, 아직 진행 중이면 아무것도 하지 않는다(각 신호가
- * 올 때마다, 그리고 알람으로 주기적으로 다시 호출돼 안전망 역할을 한다).
- */
-async function advanceVodPipeline() {
-  if (vodPipelineAdvancing) return;
-  vodPipelineAdvancing = true;
-  try {
-    for (;;) {
-      const state = await getVodPipeline();
-      if (!state || !state.running) return;
-      // 일시정지(사용자) 또는 스로틀(삭제 대기 파일 과다) 중에는 다음 다시보기로도, 시간
-      // 초과 판정으로도 넘어가지 않는다.
-      if (state.paused || state.throttled) return;
-
-      if (state.current) {
-        const settled = isCurrentVodSettled(state.current);
-        if (settled || canFastForwardVod(state)) {
-          state.done.push(state.current.videoId);
-          console.log(
-            `${VOD_PIPELINE_LOG_TAG} 다시보기 완료: ${state.current.videoId}` +
-              (settled ? '' : ' (업로드 확인 전이지만 실패 없이 로컬 배치가 끝나 바로 다음으로 진행)')
-          );
-          state.current = null;
-        } else if (Date.now() - state.current.startedAt > VOD_PIPELINE_TIMEOUT_MS) {
-          const unsettled = (state.current.fileOrders || []).filter(
-            (fo) => !state.current.confirmedFileOrders.includes(fo) && !state.current.failedFileOrders.includes(fo)
-          );
-          const reason =
-            unsettled.length > 0 ? `시간 초과 (확인 안 된 파일: ${unsettled.join(', ')})` : '시간 초과';
-          state.failed.push({ videoId: state.current.videoId, reason });
-          state.hasFailures = true;
-          recordPipelineFailure({ type: 'vod', videoId: state.current.videoId, reason });
-          state.current = null;
-        } else {
-          await setVodPipeline(state);
-          return; // 아직 진행 중 — 다음 신호나 알람을 기다린다
-        }
-      }
-
-      if (state.queue.length === 0) {
-        state.running = false;
-        await setVodPipeline(state);
-        console.log(
-          `${VOD_PIPELINE_LOG_TAG} 파이프라인 종료 — 완료 ${state.done.length}개, 실패 ${state.failed.length}개`
-        );
-        return;
-      }
-
-      const videoId = state.queue.shift();
-      // 탭을 옮기기(navigate) 전에 먼저 current를 저장해둔다 — 새 페이지의 content script가
-      // 로드되자마자 vodPipeline:initPlayer를 물어올 수 있는데, 그때 아직 state.current가
-      // 안 써져 있으면(예: 탭 이동이 저장보다 먼저 끝나버리면) 자기 차례가 아니라고 오판할
-      // 수 있다. tabId는 아직 모르니 null로 두고, init 핸들러가 tabId==null이면 그 요청을
-      // 보낸 탭을 그대로 배정하도록 이미 처리해뒀다.
-      state.current = {
-        videoId,
-        tabId: null,
-        fileOrders: null,
-        confirmedFileOrders: [],
-        failedFileOrders: [],
-        localBatchDone: false,
-        // vodPipeline:start 시점에 목록 페이지가 이미 판별해둔, 이 다시보기에서 유튜브에
-        // 이미 올라가 있는 파일들의 fileOrder — 플레이어 페이지의 배치가 이 파일들은
-        // 다시 올리지 않고 건너뛰도록 vodPipeline:initPlayer 응답에 그대로 실어 보낸다.
-        alreadyUploadedFileOrders: (state.alreadyUploadedByVideo?.[videoId] || []).slice(),
-        startedAt: Date.now(),
-      };
-      await setVodPipeline(state);
-
-      const tabId = await ensurePipelineTab(videoId);
-      // ensurePipelineTab이 도는 사이 vodPipeline:initPlayer가 먼저 tabId를 채워뒀을 수
-      // 있으니 다시 읽어와서, 아직 비어 있을 때만 채운다(오래된 값으로 덮어쓰지 않는다).
-      const freshState = await getVodPipeline();
-      if (freshState?.current?.videoId === videoId && freshState.current.tabId == null) {
-        freshState.current.tabId = tabId;
-        await setVodPipeline(freshState);
-      }
-      console.log(`${VOD_PIPELINE_LOG_TAG} 다시보기 시작: ${videoId} (tabId=${tabId})`);
-      // 방금 배정한 다시보기가 곧바로 끝나 있을 리는 없으니 루프를 빠져나가고, 플레이어
-      // 탭이 보내올 신호(filesTotal/localBatchDone/fileConfirmed)를 기다린다.
-      return;
-    }
-  } finally {
-    vodPipelineAdvancing = false;
+    console.warn(`${VOD_BATCH_LOG_TAG} 알림 생성 실패:`, error.message);
   }
 }
 
@@ -811,12 +577,6 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === LIVE_CHECK_ALARM_NAME) {
     console.log(`${LOG_TAG} 알람 발생 - 주기적 조회 시작`);
     runLiveCheck();
-    // Studio 업로드 대기열이 남아 있는데(예: 새로고침이 확인 창에 막혀서) 아무 신호도 못
-    // 받았을 경우를 대비한 안전망. 큐가 비어 있으면 drainStudioQueue가 바로 끝난다.
-    drainStudioQueue();
-    // 다시보기 파이프라인도 마찬가지로, 확인 신호가 누락됐을 때 시간 초과로 다음 다시보기로
-    // 넘어갈 수 있도록 주기적으로 다시 확인한다. 파이프라인이 안 돌고 있으면 바로 끝난다.
-    advanceVodPipeline();
   }
 });
 
@@ -838,34 +598,27 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 
-// 업로드 창으로 열었던 Studio 탭이 닫히면 보관 중이던 제목/설명도 정리합니다.
+// Studio 업로드 탭이 닫히면 기록을 지워서, 다음 요청 때 새 탭을 하나 연다.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const pending = await getPendingStudioUploads();
-  if (tabId in pending) {
-    delete pending[tabId];
-    await setPendingStudioUploads(pending);
-  }
-  // 재사용 대상 탭 자체가 닫혔다면 기록을 지워서, 다음 대기열 처리 때 새 탭을 하나 연다.
   if ((await getStudioTabId()) === tabId) {
     await setStudioTabId(null);
   }
 });
 
-// 다시보기 파이프라인이 쓰던 플레이어 탭이 닫히면(사용자가 직접 닫는 등) 그 다시보기는
-// 실패로 두고 다음으로 넘어간다. 탭 기록 자체도 지워서 다음 다시보기는 새 탭을 연다.
+// 다시보기 배치가 쓰던 플레이어 탭이 사용자에 의해 닫히면, 기록을 지우고(다음 배치는 새
+// 탭을 연다) 지금 그 배치를 기다리고 있던 vodList.js 탭에 "취소됨"으로 완료를 알려줘서
+// 영원히 응답을 기다리지 않게 한다.
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  if ((await getPipelineTabId()) === tabId) {
-    await setPipelineTabId(null);
-  }
-  const state = await getVodPipeline();
-  if (state?.running && state.current?.tabId === tabId && !isCurrentVodSettled(state.current)) {
-    const reason = '플레이어 탭이 닫힘';
-    state.failed.push({ videoId: state.current.videoId, reason });
-    state.hasFailures = true;
-    recordPipelineFailure({ type: 'vod', videoId: state.current.videoId, reason });
-    state.current = null;
-    await setVodPipeline(state);
-    advanceVodPipeline();
+  if ((await getPlayerTabId()) !== tabId) return;
+  await setPlayerTabId(null);
+  const batchRequest = await getVodBatchRequest();
+  if (batchRequest?.requesterTabId != null) {
+    sendToTab(
+      batchRequest.requesterTabId,
+      { action: 'vodBatch:complete', videoId: batchRequest.videoId, successOrders: [], failOrders: [], cancelled: true },
+      2000
+    );
+    await setVodBatchRequest(null);
   }
 });
 
@@ -975,76 +728,59 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  if (request.action === 'youtubeStudio:open') {
+  // vodFileInfo.js의 "유튜브에 업로드" — Studio 탭에 자동 입력할 데이터를 전달한다. 순서
+  // 관리는 youtubeStudio.js 내부 큐가 하므로 여기서는 설정값을 합쳐 바로 전달만 시도한다.
+  if (request.action === 'studio:upload') {
     (async () => {
       try {
-        const entry = {
+        const { vodFileInfo } = (await getSettings()).features;
+        const payload = {
           title: request.title,
           description: request.description,
           fileNames: Array.isArray(request.fileNames) ? request.fileNames : [],
           videoId: request.videoId ?? null,
           fileOrder: request.fileOrder != null ? Number(request.fileOrder) : null,
-          pipeline: Boolean(request.pipeline),
+          downloadSubfolder: normalizeSubfolder(vodFileInfo.downloadSubfolder),
+          options: {
+            visibility: vodFileInfo.youtubeVisibility,
+            notForKids: vodFileInfo.youtubeNotForKids,
+            playlists: vodFileInfo.youtubePlaylists,
+            deleteAfterUpload: vodFileInfo.deleteLocalFileAfterUpload,
+          },
         };
-
-        // 무조건 대기열에 넣고 나서 처리를 시도한다 — 탭이 이미 바쁘면(정상) 대기열에
-        // 그대로 남아 있다가 순서대로 처리된다. 탭을 여러 개 띄우지 않는다(항상 하나만
-        // 재사용, 없을 때만 딱 한 번 새로 연다).
-        const queue = await getStudioUploadQueue();
-        queue.push(entry);
-        await setStudioUploadQueue(queue);
-        console.log(`${STUDIO_LOG_TAG} 업로드 대기열에 추가 (대기 ${queue.length}개), 제목: ${entry.title}`);
-        sendResponse({ success: true, queued: true });
+        sendResponse({ success: true });
+        deliverStudioRequest(payload); // 응답은 이미 보냈으니 결과를 기다리지 않고 전달 시도
       } catch (error) {
         console.error(`${STUDIO_LOG_TAG} 업로드 요청 처리 오류:`, error);
         sendResponse({ success: false, error: error.message });
       }
-      drainStudioQueue(); // 응답은 이미 보냈으니 결과를 기다리지 않고 바로 처리 시도
     })();
     return true;
   }
 
-  if (request.action === 'youtubeStudio:becameIdle') {
-    // 어떤 Studio 탭이 저장까지 마치고 놀고 있는 상태가 됐다는 신호 — 대기열에 남은 게
-    // 있으면 다음 알람/요청을 기다리지 않고 바로 이어서 처리한다.
-    drainStudioQueue();
+  // youtubeStudio.js가 5회 연속 진전 없는 실패로 "수동 대기 상태"에 들어갔다는 신호 —
+  // 이 탭은 더 이상 자동 처리를 하지 않으므로(사용자가 직접 확인하도록 열어둔 채 둔다),
+  // 다음 요청부터는 새 탭을 연다. 그 탭이 처리하지 못하고 들고 있던 요청들도 같이
+  // 돌려받아서, 새로 열릴 탭에 순서대로 다시 전달한다.
+  if (request.action === 'studio:tabUnusable') {
+    (async () => {
+      console.warn(`${STUDIO_LOG_TAG} 탭이 수동 대기 상태로 전환됨 — 다음 요청부터 새 탭 사용 (tabId=${sender.tab?.id})`);
+      await setStudioTabId(null);
+      const leftovers = Array.isArray(request.leftoverRequests) ? request.leftoverRequests : [];
+      for (const payload of leftovers) {
+        await deliverStudioRequest(payload);
+      }
+    })();
     return false;
   }
 
-  if (request.action === 'youtubeStudio:init') {
+  // "모두 폐기" — 지금 아는 Studio 탭이 있으면 그 탭에 전달해 아직 시작 안 한 대기열만
+  // 지우게 한다(지금 자동화 중인 건 그대로 둔다). 모르는 탭이면(애초에 아무것도 없음) 그냥 끝.
+  if (request.action === 'studio:discardQueued') {
     (async () => {
-      const tabId = sender.tab?.id;
-      if (tabId == null) {
-        sendResponse({ pending: false });
-        return;
-      }
-
-      const pending = await getPendingStudioUploads();
-      let entry = pending[tabId];
-
-      if (!entry) {
-        // 이 탭에 아직 배정된 항목이 없다 — 우리가 재사용하려는 그 탭이거나(새로고침 직후 등)
-        // 탭이 아직 없어서 방금 새로 연 탭이라면, 대기열 맨 앞 항목을 지금 바로 배정한다.
-        const studioTabId = await getStudioTabId();
-        if (studioTabId == null || studioTabId === tabId) {
-          const queue = await getStudioUploadQueue();
-          if (queue.length > 0) {
-            entry = queue[0];
-            await setStudioUploadQueue(queue.slice(1));
-            pending[tabId] = entry;
-            await setPendingStudioUploads(pending);
-            if (studioTabId == null) await setStudioTabId(tabId);
-          }
-        }
-      }
-
-      if (!entry) {
-        const managed = (await getStudioTabId()) === tabId;
-        sendResponse({ pending: false, managed });
-        return;
-      }
-      console.log(`${STUDIO_LOG_TAG} Studio 탭에 제목/설명/옵션 전달 (tabId=${tabId})`);
-      sendResponse({ pending: true, ...(await buildStudioPayload(entry)) });
+      const tabId = await getStudioTabId();
+      if (tabId != null) sendToTab(tabId, { action: 'studio:discardQueued' }, 2000);
+      sendResponse({ success: true });
     })();
     return true;
   }
@@ -1075,215 +811,66 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // 목록 페이지의 "모두 업로드": 다시보기 id 큐를 새로 시작한다(이미 돌고 있으면 무시).
-  if (request.action === 'vodPipeline:start') {
+  // 목록 페이지의 "모두 업로드"가 다시보기 하나를 순서대로 맡긴다. 큐(다음엔 뭘 할지)는
+  // vodList.js가 들고 있으므로, 여기서는 플레이어 탭을 그 다시보기로 열거나 이동시키고
+  // 전달하는 것까지만 한다.
+  if (request.action === 'vodBatch:start') {
     (async () => {
-      const videoIds = Array.isArray(request.videoIds) ? request.videoIds.map(String) : [];
-      const existing = await getVodPipeline();
-      if (existing?.running) {
-        sendResponse({ success: false, error: '이미 실행 중인 파이프라인이 있습니다.' });
-        return;
-      }
-      if (videoIds.length === 0) {
-        sendResponse({ success: false, error: '처리할 다시보기가 없습니다.' });
-        return;
-      }
-      // 목록 페이지가 유튜브 업로드 여부를 파일 단위로 미리 판별해 { videoId: [fileOrder, ...] }
-      // 형태로 넘겨준다 — 다시보기 전체가 미완료라도 그중 이미 올라간 파일은 다시 올리지
-      // 않도록 advanceVodPipeline이 각 다시보기의 current로 넘길 때 이 값을 참조한다.
-      const alreadyUploadedByVideo =
-        request.alreadyUploaded && typeof request.alreadyUploaded === 'object' ? request.alreadyUploaded : {};
-      await setVodPipeline({
-        running: true,
-        queue: videoIds,
-        current: null,
-        done: [],
-        failed: [],
-        hasFailures: false,
-        paused: false,
-        throttled: false,
-        pausedAt: null,
-        alreadyUploadedByVideo,
-      });
-      console.log(`${VOD_PIPELINE_LOG_TAG} 파이프라인 시작 — 다시보기 ${videoIds.length}개`, videoIds);
-      sendResponse({ success: true, total: videoIds.length });
-      advanceVodPipeline();
-    })();
-    return true;
-  }
-
-  if (request.action === 'vodPipeline:stop') {
-    (async () => {
-      const state = await getVodPipeline();
-      if (state) {
-        const stoppedTabId = state.current?.tabId ?? null;
-        state.running = false;
-        await setVodPipeline(state);
-        if (stoppedTabId != null) {
-          sendToTab(stoppedTabId, { action: 'vodPipeline:cancelCurrent' }, 2000);
-        }
-      }
+      const videoId = String(request.videoId);
+      const skipFileOrders = Array.isArray(request.skipFileOrders) ? request.skipFileOrders.map(Number) : [];
+      await setVodBatchRequest({ requesterTabId: sender.tab?.id ?? null, videoId });
       sendResponse({ success: true });
+
+      const tabId = await ensureTabAt(getPlayerTabId, setPlayerTabId, `${VOD_PLAYER_URL_PREFIX}${videoId}`, {
+        navigateIfExists: true,
+      });
+      await sendWithRetry(tabId, { action: 'vodBatch:begin', videoId, skipFileOrders });
     })();
     return true;
   }
 
-  // 전체 배치(파이프라인)를 일시정지한다 — 중단과 달리 진행 상황을 그대로 두고, 지금
-  // 처리 중인 다시보기 탭에도 알려 파일 단위 진행(다음 파일 다운로드/업로드)도 멈춘다.
-  // 이미 시작된 다운로드/업로드/Studio 자동화는 되돌리지 않는다.
-  if (request.action === 'vodPipeline:pause') {
-    setPipelinePauseFlag('paused', true).then(sendResponse);
-    return true;
-  }
-
-  if (request.action === 'vodPipeline:resume') {
-    setPipelinePauseFlag('paused', false).then(sendResponse);
-    return true;
-  }
-
-  // Studio 탭에서 "삭제 대기 중"인 파일의 목록에 변화가 생겼다(watchUploadAndDelete가
-  // 시작/종료될 때마다 보낸다 — 자동 삭제 대상은 확인 감시 시작 시점부터, 수동 삭제
-  // 대상(manual:true)은 "업로드됨" 확인 시점부터). 개수가 너무 쌓이면(디스크 공간 위험)
-  // 배치를 자동으로 일시정지시키고, 줄어들면 자동으로 재개한다 — PENDING_DELETION_* 아래
-  // 참고. 단, 이 자동 일시정지/재개 판단은 manual:false(자동 삭제) 항목의 개수만 본다 —
-  // manual:true 항목은 사용자가 버튼을 언제 누를지 알 수 없어, 이걸로 문턱을 넘겼다고
-  // 배치를 멈추면 사용자가 안 지우는 한 무한정 멈춰있을 수 있기 때문이다. manual 항목은
-  // 패널에는 여전히 표시된다(Studio 배너의 접이식 목록).
-  if (request.action === 'vodPipeline:deletionPendingChanged') {
+  // vodFileInfo.js가 로컬 단계(다운로드 + Studio 업로드 요청 제출)를 끝냈다 — Studio의 실제
+  // 전송 확인은 기다리지 않고 바로 완료로 친다. 실패 파일이 있으면 기록/알림을 남기고,
+  // 이 배치를 요청했던 vodList.js 탭에 결과를 그대로 전달한다.
+  if (request.action === 'vodBatch:complete') {
     (async () => {
-      const key = `${request.videoId}:${Number(request.fileOrder)}`;
-      let list = await getPendingDeletions();
-      const exists = list.some((d) => d.key === key);
-      if (request.pending && !exists) {
-        list = [
-          ...list,
+      const failOrders = Array.isArray(request.failOrders) ? request.failOrders : [];
+      for (const failure of failOrders) {
+        recordPipelineFailure({
+          videoId: request.videoId,
+          fileOrder: Number(failure.fileOrder),
+          reason: failure.reason || '알 수 없는 오류',
+        });
+      }
+      const batchRequest = await getVodBatchRequest();
+      if (batchRequest?.requesterTabId != null) {
+        sendToTab(
+          batchRequest.requesterTabId,
           {
-            key,
-            videoId: String(request.videoId),
-            fileOrder: Number(request.fileOrder),
-            title: request.title,
-            manual: Boolean(request.manual),
-            startedAt: Date.now(),
-          },
-        ];
-      } else if (!request.pending && exists) {
-        list = list.filter((d) => d.key !== key);
-      }
-      await setPendingDeletions(list);
-      notifyPendingDeletionsToTab(list);
-
-      const state = await getVodPipeline();
-      if (state?.running) {
-        const autoPendingCount = list.filter((d) => !d.manual).length;
-        if (autoPendingCount >= PENDING_DELETION_PAUSE_THRESHOLD && !state.throttled) {
-          console.log(`${VOD_PIPELINE_LOG_TAG} 삭제 대기 파일(자동) ${autoPendingCount}개 — 배치 자동 일시정지`);
-          await setPipelinePauseFlag('throttled', true);
-        } else if (autoPendingCount <= PENDING_DELETION_RESUME_THRESHOLD && state.throttled) {
-          console.log(`${VOD_PIPELINE_LOG_TAG} 삭제 대기 파일(자동) ${autoPendingCount}개 — 배치 자동 재개`);
-          await setPipelinePauseFlag('throttled', false);
-        }
-      }
-      sendResponse({ success: true, pendingCount: list.length });
-    })();
-    return true;
-  }
-
-  // Studio 패널이 배너를 (다시) 띄울 때 지금까지의 삭제 대기 목록을 보여주기 위해 물어본다.
-  if (request.action === 'vodPipeline:getPendingDeletions') {
-    getPendingDeletions().then((deletions) => sendResponse({ success: true, deletions }));
-    return true;
-  }
-
-  if (request.action === 'vodPipeline:status') {
-    getVodPipeline().then((state) => sendResponse({ success: true, state }));
-    return true;
-  }
-
-  // 플레이어 탭이 로드될 때마다 "지금 내가 파이프라인이 맡긴 그 다시보기냐"고 물어온다.
-  if (request.action === 'vodPipeline:initPlayer') {
-    (async () => {
-      const tabId = sender.tab?.id;
-      const state = await getVodPipeline();
-      const active =
-        Boolean(state?.running) &&
-        state.current?.videoId === String(request.videoId) &&
-        (state.current.tabId == null || state.current.tabId === tabId);
-      if (active && tabId != null && state.current.tabId == null) {
-        state.current.tabId = tabId;
-        await setVodPipeline(state);
-      }
-      // 탭이 새로 로드된 시점에 이미 일시정지 상태였다면(예: 일시정지 중 새로고침) 그
-      // 사실을 같이 알려줘서 배치를 곧바로 시작하지 않고 정지 상태로 대기하게 한다.
-      // alreadyUploadedFileOrders: 이 다시보기에서 유튜브에 이미 올라가 있는 파일들 —
-      // 배치가 이 파일들은 건너뛰도록 vodFileInfo.js에 그대로 전달한다.
-      sendResponse({
-        active,
-        paused: Boolean(state?.paused),
-        alreadyUploadedFileOrders: active ? state.current.alreadyUploadedFileOrders || [] : [],
-      });
-    })();
-    return true;
-  }
-
-  // 플레이어 탭이 이 다시보기의 전체 파일 목록(fileOrder들)을 알려준다 — 완료 판정 기준.
-  if (request.action === 'vodPipeline:filesTotal') {
-    (async () => {
-      const state = await getVodPipeline();
-      if (state?.current?.videoId === String(request.videoId)) {
-        state.current.fileOrders = Array.isArray(request.fileOrders) ? request.fileOrders.map(Number) : [];
-        await setVodPipeline(state);
-        advanceVodPipeline();
-      }
-      sendResponse({ success: true });
-    })();
-    return true;
-  }
-
-  // 플레이어 탭의 로컬 다운로드/업로드 요청 단계가 끝났다 — 여기서 이미 실패한 파일은
-  // Studio에서 올 확인 신호를 영원히 기다리지 않도록 실패로 확정해둔다.
-  if (request.action === 'vodPipeline:localBatchDone') {
-    (async () => {
-      const state = await getVodPipeline();
-      if (state?.current?.videoId === String(request.videoId)) {
-        const failures = Array.isArray(request.failures) ? request.failures : [];
-        const failedFileOrders = failures.map((f) => Number(f.fileOrder));
-        state.current.failedFileOrders = [...new Set([...state.current.failedFileOrders, ...failedFileOrders])];
-        // "마지막 파일까지 다운로드해서 Studio 쪽에 업로드 요청까지 마쳤다"는 시점 —
-        // advanceVodPipeline의 canFastForwardVod가 이 플래그를 본다.
-        state.current.localBatchDone = true;
-        if (failures.length > 0) state.hasFailures = true;
-        await setVodPipeline(state);
-        // 파일 하나하나의 실패도 반드시 사용자에게 알린다(로그 + 알림 + 영구 히스토리).
-        for (const failure of failures) {
-          recordPipelineFailure({
-            type: 'file',
+            action: 'vodBatch:complete',
             videoId: request.videoId,
-            fileOrder: Number(failure.fileOrder),
-            reason: failure.reason || '알 수 없는 오류',
-          });
-        }
-        advanceVodPipeline();
+            successOrders: Array.isArray(request.successOrders) ? request.successOrders : [],
+            failOrders,
+            cancelled: Boolean(request.cancelled),
+          },
+          2000
+        );
       }
+      await setVodBatchRequest(null);
       sendResponse({ success: true });
     })();
     return true;
   }
 
-  // Studio 탭에서 특정 파일의 업로드(공개 상태) 확인이 끝났다.
-  if (request.action === 'vodPipeline:fileConfirmed') {
+  // vodList.js의 "중단" — 지금 플레이어 탭이 돌리고 있는 배치를 즉시 멈춘다(이미 시작된
+  // 파일의 다운로드/업로드는 그대로 끝까지 둔다 — 기존 "배치 중단" 버튼과 같은 정책).
+  if (request.action === 'vodBatch:cancel') {
     (async () => {
-      const state = await getVodPipeline();
-      if (state?.current?.videoId === String(request.videoId)) {
-        const fileOrder = Number(request.fileOrder);
-        if (!state.current.confirmedFileOrders.includes(fileOrder)) {
-          state.current.confirmedFileOrders.push(fileOrder);
-        }
-        await setVodPipeline(state);
-        console.log(`${VOD_PIPELINE_LOG_TAG} 파일 확인됨: ${request.videoId}:${fileOrder}`);
-        advanceVodPipeline();
-      }
+      const tabId = await getPlayerTabId();
+      if (tabId != null) sendToTab(tabId, { action: 'vodBatch:cancelCurrent' }, 2000);
+      sendResponse({ success: true });
     })();
-    return false; // 확인 응답을 기다릴 필요 없는 알림성 메시지
+    return true;
   }
 
   if (request.action === 'download:cancel') {
