@@ -36,6 +36,10 @@ const DEFAULT_SETTINGS = {
       downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
       deleteLocalFileAfterUpload: false, // 업로드(파일 전송) 완료가 확인되면 로컬 mp4 자동 삭제. 기본 꺼짐(되돌릴 수 없음)
     },
+    balloonSync: {
+      webAppUrl: '',
+      token: '',
+    },
   },
 };
 
@@ -74,6 +78,12 @@ const el = {
   addYoutubePlaylistBtn: document.getElementById('addYoutubePlaylistBtn'),
   youtubePlaylistList: document.getElementById('youtubePlaylistList'),
   youtubePlaylistEmptyHint: document.getElementById('youtubePlaylistEmptyHint'),
+
+  balloonWebAppUrl: document.getElementById('balloonWebAppUrl'),
+  balloonToken: document.getElementById('balloonToken'),
+  balloonSyncRecentBtn: document.getElementById('balloonSyncRecentBtn'),
+  balloonBackfillBtn: document.getElementById('balloonBackfillBtn'),
+  balloonResult: document.getElementById('balloonResult'),
 
   toast: document.getElementById('toast'),
 };
@@ -128,6 +138,9 @@ function renderAll() {
   el.deleteLocalFileAfterUpload.checked = vodFileInfo.deleteLocalFileAfterUpload;
   updateCardBodyState(el.vodFileInfoBody, vodFileInfo.enabled);
   renderYoutubePlaylists();
+
+  el.balloonWebAppUrl.value = settings.features.balloonSync.webAppUrl;
+  el.balloonToken.value = settings.features.balloonSync.token;
 }
 
 function updateCardBodyState(bodyEl, enabled) {
@@ -326,6 +339,58 @@ function setupEventListeners() {
   el.newYoutubePlaylist.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') handleAddYoutubePlaylist();
   });
+
+  el.balloonWebAppUrl.addEventListener('change', (e) => {
+    settings.features.balloonSync.webAppUrl = e.target.value.trim();
+    persistSettings();
+  });
+
+  el.balloonToken.addEventListener('change', (e) => {
+    settings.features.balloonSync.token = e.target.value.trim();
+    persistSettings();
+  });
+
+  el.balloonSyncRecentBtn.addEventListener('click', handleBalloonSyncRecent);
+  el.balloonBackfillBtn.addEventListener('click', handleBalloonBackfill);
+}
+
+async function handleBalloonSyncRecent() {
+  setBalloonBusy(true);
+  el.balloonResult.textContent = '최근 3개월 선물 내역과 이번·지난달 구매 내역을 가져오는 중...';
+  const response = await chrome.runtime.sendMessage({ action: 'balloon:syncRecent' }).catch((error) => ({ success: false, error: error.message }));
+  el.balloonResult.textContent = formatBalloonResult(response);
+  setBalloonBusy(false);
+}
+
+// 과거 구매 내역은 해마다 나눠서 요청한다. 한 번에 몰면 서비스 워커가 중간에 꺼질 수 있어서다.
+async function handleBalloonBackfill() {
+  setBalloonBusy(true);
+  const currentYear = new Date().getFullYear();
+  const lines = [];
+  for (let year = 2010; year <= currentYear; year += 1) {
+    el.balloonResult.textContent = `${year}년 구매 내역 가져오는 중... (${lines.length}/${currentYear - 2010 + 1}년 완료)`;
+    const response = await chrome.runtime.sendMessage({ action: 'balloon:syncYear', year }).catch((error) => ({ success: false, error: error.message }));
+    lines.push(`${year}년: ${formatBalloonResult(response)}`);
+  }
+  el.balloonResult.textContent = lines.join('\n');
+  setBalloonBusy(false);
+}
+
+function setBalloonBusy(busy) {
+  el.balloonSyncRecentBtn.disabled = busy;
+  el.balloonBackfillBtn.disabled = busy;
+}
+
+function formatBalloonResult(response) {
+  if (!response?.success) return `실패: ${response?.error || '알 수 없는 오류'}`;
+  const added = response.result?.added || {};
+  const total = Object.values(added).reduce((sum, n) => sum + n, 0);
+  const bySheet = Object.entries(added)
+    .filter(([, n]) => n > 0)
+    .map(([sheet, n]) => `${sheet} ${n}건`)
+    .join(', ');
+  const missions = response.result?.missionsUpdated ? `, 도전미션누적 ${response.result.missionsUpdated}건` : '';
+  return `새로 추가 ${total}건${bySheet ? ` (${bySheet})` : ''}${missions}`;
 }
 
 function handleAddStreamer() {

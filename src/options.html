@@ -168,6 +168,32 @@
       </div>
     </section>
 
+    <section class="card">
+      <div class="card-header">
+        <h2>💰 별풍선 이력 동기화</h2>
+      </div>
+      <p class="card-desc">
+        SOOP 포인트 페이지의 별풍선 구매·선물 내역을 가져와 구글 시트(구매, 라이브, 동영상, 방송국, 대결미션, 도전미션, 도전미션누적)에
+        중복 없이 추가합니다. 선물 내역은 최근 3개월만 보이므로 자주 동기화하세요. 구매 내역은 아래 버튼으로 과거 전체를 한 번 가져올 수 있습니다.
+        웹앱 URL과 토큰은 secret/Code.gs를 Apps Script에 배포한 뒤 입력합니다.
+      </p>
+      <div class="card-body">
+        <div class="field">
+          <label for="balloonWebAppUrl">Apps Script 웹앱 URL</label>
+          <input type="text" id="balloonWebAppUrl" placeholder="https://script.google.com/macros/s/.../exec">
+        </div>
+        <div class="field">
+          <label for="balloonToken">공유 토큰 (Apps Script 스크립트 속성 SYNC_TOKEN과 같은 값)</label>
+          <input type="password" id="balloonToken" placeholder="토큰">
+        </div>
+        <div class="input-group">
+          <button id="balloonSyncRecentBtn" class="btn-primary">지금 동기화 (최근 3개월 선물 + 구매)</button>
+          <button id="balloonBackfillBtn" class="btn-primary">과거 구매 전체 가져오기</button>
+        </div>
+        <p class="empty-hint" id="balloonResult"></p>
+      </div>
+    </section>
+
     <div id="toast" class="toast"></div>
   </div>
 

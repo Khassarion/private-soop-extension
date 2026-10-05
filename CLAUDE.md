@@ -113,6 +113,21 @@ None of this has been run end-to-end in a real browser yet (same caveat as alway
 
 이 배치 흐름(탭 간 메시지, 실제 타이밍, 데스크톱 알림이 실제로 뜨는지)은 아직 실제 브라우저에서 처음부터 끝까지 돌려보지 않았다 — 기존과 같은 캐비엇.
 
+### 별풍선 이력 동기화 (background.js + balloonParser.js + soopLiveApi.js + options.js + secret/Code.gs)
+
+SOOP 포인트 페이지(`point.sooplive.com/Report/AfreecaBalloonList.asp`)의 구매·선물 내역을 가져와 구글 시트에 중복 없이 추가한다. 수집은 로그인 쿠키가 있는 확장에서만 가능하므로 확장이 가져오고, 기록과 `main` 집계는 Apps Script 웹앱(`secret/Code.gs`의 `doPost`)이 맡는다. Apps Script의 `UrlFetchApp`에는 사용자 세션이 없어 수집을 맡길 수 없다.
+
+- **요청 형식**: `POST /Report/AfreecaBalloonList.asp`, 폼 `gifttype`(1 라이브, 2 동영상, 3 방송국, 7 대결미션, 8 도전미션; 4·5·6은 시트가 없어 무시), `year`, `month`, `paytype=0`, `currpage_out`(선물 페이지), `currpage_in`(구매 페이지). 응답 한 장에 구매 테이블(table 0)과 선물 테이블이 같이 있다.
+- **필터 차이가 핵심**: 선물 내역은 `year`/`month`와 무관하게 최근 3개월이 나온다(월 셀렉트 값과 상관없이 7~10월이 섞여 나옴). 구매 내역은 year/month 셀렉트로 필터된다. 그래서 선물은 gifttype별로 페이지만 넘기고, 구매는 연·월을 순회한다(과거 전체 backfill은 옵션 페이지 버튼으로 해마다 나눠 요청 — 한 번에 몰면 서비스 워커가 꺼질 수 있다).
+- **페이지네이션**: 페이지당 10행. `currpage`를 1부터 올리고 10행 미만이 나오면 마지막 페이지다. 11페이지 이후는 `다음10개` 블록이지만 번호를 계속 올리면 된다.
+- **파싱**: 서비스 워커에는 DOMParser가 없어 `balloonParser.js`가 정규식으로 파싱한다. 테이블은 **헤더 텍스트로 식별**하고(위치가 아님), 로그인이 풀린 응답처럼 테이블이 하나도 없으면 실패로 처리한다. 날짜는 `2026-09-21 오후 7:57:21`(도전미션) 형식이 섞여 있어 24시간제 `YYYY-MM-DD HH:mm:ss`로 맞춘다. 스트리머 셀 `닉<em>(id)</em>`은 `닉(id)`가 된다. 동영상 셀의 `<a href>`는 URL로 뽑아 시트 하이퍼링크 수식으로 쓴다.
+- **도전미션 요약(table 2)** 은 `도전미션누적` 시트로 간다. 페이지마다 같은 요약이 반복될 수 있어 같은 요약 본문이면 한 번만 쓴다.
+- **중복 제외 (Apps Script)**: 행마다 키 = 정규화된 날짜(KST) + 나머지 셀(숫자는 `Number`로 맞춤). 키 개수를 셈(multiset)해서 시트에 이미 있는 만큼만 건너뛰고 나머지는 추가한다 — 같은 초에 찍힌 정당한 중복 후원을 잃지 않기 위함이다. 동영상 열(링크)은 키에서 뺀다(손으로 적은 `보기` 텍스트 행과 매칭되게). 도전미션누적은 미션 내용·총 후원·결과가 모두 같은 행만 건너뛰고, 기존 행은 덮어쓰지 않는다 — 같은 이름의 미션이 여러 번 나올 수 있어서 이름만으로 덮어쓰면 서로 다른 미션이 합쳐진다.
+- **시트 값**: 날짜는 `Date`, 별풍선 개수는 `Number`, 목소리 없음은 `-`, 구매 금액은 `165,000원` 텍스트 그대로. 열 순서는 확장이 보내는 행의 순서와 같다(`SYNC_SHEETS` 참고).
+- **설정**: `settings.features.balloonSync = {webAppUrl, token}`. 토큰은 Apps Script 스크립트 속성 `SYNC_TOKEN`과 같은 값이며 확장 옵션 페이지에서 입력한다. `secret/`는 gitignore 대상이라 Apps Script 코드는 저장소에 커밋되지 않는다.
+- **권한**: `manifest.json`의 `host_permissions`에 `point.sooplive.com`, `script.google.com`, `script.googleusercontent.com`(웹앱 리다이렉트)이 있어야 한다.
+- **미검증**: 11페이지 이상 응답, 구매의 다중 페이지 마크업, 3개월 경계, 로그인 만료 응답 형태, 확장 `fetch`에 Referer를 못 붙이는 것이 서버 검사에 걸리는지, backfill 요청 속도 제한. 저장된 응답 문서(`secret/doc_starballoon_*`)로 파서와 중복 판정 로직은 오프라인 검증했다.
+
 ### Legacy/unused files
 
 `src/popup.html`, `popup.js`, `styles.css`, `soopHandler.js`, `taskRunner.js`, `dummy.js` are **not referenced by `manifest.json`** — superseded by the in-page panel (`content.js`) and the options page. Don't extend them and don't assume they run; they're kept around but dead.

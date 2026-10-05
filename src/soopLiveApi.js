@@ -9,6 +9,7 @@ const AFEVENT2_ORIGIN = 'https://afevent2.sooplive.com';
 const TKAPI_ORIGIN = 'https://tkapi.sooplive.com';
 const API_M_ORIGIN = 'https://api.m.sooplive.com';
 const VOD_ORIGIN = 'https://vod.sooplive.com';
+const POINT_ORIGIN = 'https://point.sooplive.com';
 
 /**
  * 스트리머 라이브 방송 정보 조회. 방송 중이 아니면 null.
@@ -137,4 +138,28 @@ export async function getSoopVodInfo(videoId) {
   const body = await res.json();
   if (!body || body.result !== 1 || !body.data) return null;
   return body.data;
+}
+
+/**
+ * 별풍선 내역 페이지 HTML 한 장. 구매 테이블은 year/month 필터(currpageIn 페이지),
+ * 선물 테이블은 gifttype별 최근 3개월 목록(currpageOut 페이지)이다. 응답 HTML 텍스트를 그대로 돌려준다.
+ * @returns {Promise<string>}
+ */
+export async function getBalloonPage({ gifttype, year, month, currpageOut = 1, currpageIn = 1 }) {
+  const body = new URLSearchParams({
+    currpage_in: String(currpageIn),
+    currpage_out: String(currpageOut),
+    gifttype: String(gifttype),
+    year: String(year),
+    month: String(month).padStart(2, '0'),
+    paytype: '0',
+  });
+  const res = await fetch(`${POINT_ORIGIN}/Report/AfreecaBalloonList.asp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    credentials: 'include',
+  });
+  if (!res.ok) throw new Error(`별풍선 내역 요청 실패 (${res.status})`);
+  return res.text();
 }

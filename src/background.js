@@ -3,8 +3,9 @@
  * 확장 프로그램의 백그라운드 작업을 처리합니다.
  */
 
-import { isStreamerLive, getLoginId, getMissionStatus, getSoopVodInfo } from './soopLiveApi.js';
+import { isStreamerLive, getLoginId, getMissionStatus, getSoopVodInfo, getBalloonPage } from './soopLiveApi.js';
 import { indexYoutubeUploads, matchVodFiles } from './youtubeMatch.js';
+import { parseBalloonPage } from './balloonParser.js';
 
 // 지금 로드된 게 최신 버전인지 콘솔에서 바로 확인할 수 있도록, 서비스 워커가 깨어날 때마다
 // (설치/재시작/업데이트 후 첫 실행 포함) manifest.json의 version을 그대로 찍는다.
@@ -54,6 +55,10 @@ const DEFAULT_SETTINGS = {
       youtubePlaylists: [], // Studio에 보이는 재생목록 이름 (정확히 일치해야 함)
       downloadSubfolder: '', // Chrome 다운로드 폴더 기준 하위 폴더 (비우면 바로 저장)
       deleteLocalFileAfterUpload: false, // 업로드(파일 전송) 완료가 확인되면 로컬 mp4 자동 삭제. 기본 꺼짐(되돌릴 수 없음)
+    },
+    balloonSync: {
+      webAppUrl: '', // Apps Script 웹앱 배포 URL (secret/Code.gs의 doPost)
+      token: '', // 웹앱 Script Property SYNC_TOKEN과 같은 값
     },
   },
 };
@@ -623,6 +628,113 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 });
 
 // 메시지 리스너
+// ---------------------------------------------------------------------------
+// 별풍선 이력 동기화: SOOP 포인트 페이지 내역을 가져와 Apps Script 웹앱으로 보낸다. 웹앱이
+// 시트에 중복 없이 추가하고 main을 갱신한다(secret/Code.gs의 doPost). 수집은 로그인 쿠키가
+// 있는 이 확장에서만 가능하다 — Apps Script의 UrlFetchApp에는 사용자 세션이 없다.
+// ---------------------------------------------------------------------------
+const BALLOON_GIFT_SHEETS = { 1: '라이브', 2: '동영상', 3: '방송국', 7: '대결미션', 8: '도전미션' };
+const BALLOON_PAGE_SIZE = 10;
+const BALLOON_MAX_PAGES = 200;
+const BALLOON_REQUEST_DELAY_MS = 400;
+
+function balloonSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function currentKstYearMonth() {
+  const kst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return { year: kst.getUTCFullYear(), month: kst.getUTCMonth() + 1 };
+}
+
+async function fetchBalloonPageParsed(params) {
+  const parsed = parseBalloonPage(await getBalloonPage(params));
+  if (Object.keys(parsed).length === 0) {
+    throw new Error('별풍선 내역을 읽지 못했습니다. 로그인 상태나 페이지 구조를 확인해주세요.');
+  }
+  return parsed;
+}
+
+/** 선물 내역 한 gifttype의 전 페이지. 선물 내역은 연·월 필터가 없이 최근 3개월이 나온다. */
+async function fetchBalloonGifts(gifttype, year, month, rowsBySheet, missions, seenSummaries) {
+  const sheet = BALLOON_GIFT_SHEETS[gifttype];
+  for (let page = 1; page <= BALLOON_MAX_PAGES; page += 1) {
+    const parsed = await fetchBalloonPageParsed({ gifttype, year, month, currpageOut: page, currpageIn: 1 });
+    const pageRows = parsed[sheet] || [];
+    (rowsBySheet[sheet] ||= []).push(...pageRows);
+
+    // 도전미션 요약 테이블은 페이지마다 같은 내용이 반복될 수 있어, 같은 요약이 두 번 나오면 한 번만 쓴다.
+    const summary = parsed['도전미션누적'] || [];
+    const signature = JSON.stringify(summary);
+    if (summary.length > 0 && !seenSummaries.has(signature)) {
+      seenSummaries.add(signature);
+      missions.push(...summary);
+    }
+
+    if (pageRows.length < BALLOON_PAGE_SIZE) break;
+    await balloonSleep(BALLOON_REQUEST_DELAY_MS);
+  }
+}
+
+/** 구매 내역 한 달의 전 페이지. 구매 테이블은 year/month 셀렉트로 필터된다. */
+async function fetchBalloonPurchases(year, month, rowsBySheet) {
+  for (let page = 1; page <= BALLOON_MAX_PAGES; page += 1) {
+    const parsed = await fetchBalloonPageParsed({ gifttype: 1, year, month, currpageOut: 1, currpageIn: page });
+    const pageRows = parsed['구매'] || [];
+    (rowsBySheet['구매'] ||= []).push(...pageRows);
+    if (pageRows.length < BALLOON_PAGE_SIZE) break;
+    await balloonSleep(BALLOON_REQUEST_DELAY_MS);
+  }
+}
+
+async function postBalloonRows(rowsBySheet, missions) {
+  const { balloonSync } = (await getSettings()).features;
+  if (!balloonSync.webAppUrl || !balloonSync.token) {
+    throw new Error('Apps Script 웹앱 URL과 토큰을 먼저 입력해주세요.');
+  }
+  const res = await fetch(balloonSync.webAppUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ token: balloonSync.token, rows: rowsBySheet, missions }),
+  });
+  let json;
+  try {
+    json = await res.json();
+  } catch (_error) {
+    throw new Error(`웹앱 응답을 해석하지 못했습니다 (HTTP ${res.status})`);
+  }
+  if (!json.ok) throw new Error(json.error || '웹앱 처리에 실패했습니다.');
+  return json;
+}
+
+/** 최근 3개월 선물 내역 + 이번 달·지난달 구매 내역을 동기화한다. */
+async function syncBalloonRecent() {
+  const now = currentKstYearMonth();
+  const previous = now.month === 1 ? { year: now.year - 1, month: 12 } : { year: now.year, month: now.month - 1 };
+  const rowsBySheet = {};
+  const missions = [];
+  const seenSummaries = new Set();
+
+  for (const gifttype of Object.keys(BALLOON_GIFT_SHEETS).map(Number)) {
+    await fetchBalloonGifts(gifttype, now.year, now.month, rowsBySheet, missions, seenSummaries);
+  }
+  await fetchBalloonPurchases(now.year, now.month, rowsBySheet);
+  await fetchBalloonPurchases(previous.year, previous.month, rowsBySheet);
+
+  return postBalloonRows(rowsBySheet, missions);
+}
+
+/** 구매 내역 과거 backfill: 한 해(year)의 1~12월(이번 해면 이번 달까지) 구매 내역을 동기화한다. */
+async function syncBalloonPurchasesOfYear(year) {
+  const now = currentKstYearMonth();
+  const lastMonth = year === now.year ? now.month : 12;
+  const rowsBySheet = {};
+  for (let month = 1; month <= lastMonth; month += 1) {
+    await fetchBalloonPurchases(year, month, rowsBySheet);
+  }
+  return postBalloonRows(rowsBySheet, []);
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getStatus') {
     sendResponse({ status: 'active' });
@@ -967,6 +1079,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: true, downloadId });
       } catch (error) {
         console.error('[download] 다운로드 시작 오류:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
+  if (request.action === 'balloon:syncRecent' || request.action === 'balloon:syncYear') {
+    (async () => {
+      try {
+        const result =
+          request.action === 'balloon:syncRecent'
+            ? await syncBalloonRecent()
+            : await syncBalloonPurchasesOfYear(Number(request.year));
+        console.log('[balloon] 동기화 결과', result);
+        sendResponse({ success: true, result });
+      } catch (error) {
+        console.error('[balloon] 동기화 실패:', error);
         sendResponse({ success: false, error: error.message });
       }
     })();
