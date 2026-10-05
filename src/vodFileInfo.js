@@ -537,6 +537,11 @@
     const label = totalCount > 1
       ? `${dateLabel} (${index + 1}/${totalCount})`
       : dateLabel;
+    // 유튜브 제목(label)은 "n/max" 그대로 쓰지만, 파일명에는 '/'를 쓸 수 없어 로컬 저장
+    // 파일명에는 "n of max" 표기를 따로 쓴다(buildLocalFileName 참고).
+    const fileNameLabel = totalCount > 1
+      ? `${dateLabel} (${index + 1} of ${totalCount})`
+      : dateLabel;
 
     const descriptionLines = [
       `VOD: ${vodUrl}`,
@@ -549,6 +554,7 @@
       index,
       fileOrder: Number(file.file_order),
       label,
+      fileNameLabel,
       startText,
       endText,
       durationText,
@@ -629,7 +635,9 @@
       // 못 얻으면(로그인 문제 등) 대괄호 부분만으로 진행한다.
       let title = `[${meta.label}]`;
       // Studio 업로드 창에 자동 첨부할 파일의 후보 이름: 우리 다운로드 버튼으로 받았을 때
-      // 기록해둔 실제 저장 이름(브라우저가 바꿨을 수 있음) + Soop이 알려준 원래 파일명.
+      // 기록해둔 실제 저장 이름(브라우저가 바꿨을 수 있음) + downloadFile()이 저장에 쓰는
+      // "[날짜 라벨] 원본파일명" 조합(buildLocalFileName, 방송 제목 충돌 방지) + Soop이
+      // 알려준 원래 파일명(이 확장을 거치지 않고 다른 방법으로 받아둔 레거시 파일 대비).
       const fileNames = [];
       try {
         const fileList = await getDownloadFileList();
@@ -641,6 +649,8 @@
           const { downloadedFiles } = await chrome.storage.local.get(['downloadedFiles']);
           const savedName = downloadedFiles?.[downloadRecordKey(videoId, entry.file_order)]?.name;
           if (savedName) fileNames.push(savedName);
+          const combinedName = buildLocalFileName(meta, entry.file_name);
+          if (!fileNames.includes(combinedName)) fileNames.push(combinedName);
           if (entry.file_name && !fileNames.includes(entry.file_name)) fileNames.push(entry.file_name);
         }
       } catch (_error) {
@@ -680,6 +690,24 @@
   function deriveContentTitle(fileName) {
     if (!fileName) return '';
     return fileName.replace(/\.[^./]+$/, '').replace(/_\d+$/, '');
+  }
+
+  /**
+   * 로컬에 저장할 파일 이름. 스트리머가 같은 방송 제목을 여러 날 반복해서 쓰는 경우가
+   * 있어서, Soop이 주는 원본 파일명(entry.file_name)만으로 저장하면 서로 다른 날짜의
+   * 파일이 같은 이름으로 섞일 수 있다 — 그러면 Studio 자동 첨부 매칭(youtubeStudio.js의
+   * buildNameMatchers/searchDirectory, 파일명만으로 디스크를 찾는다)이 엉뚱한 날짜의
+   * 파일을 집을 위험이 있다. 다시보기 전체에서 유일한 날짜/순번 라벨을 원본 파일명 앞에
+   * 대괄호로 붙여 저장해 이름 자체를 고유하게 만든다.
+   *
+   * 유튜브 제목에 쓰는 meta.label은 "(n/max)" 그대로 두고(기존 그대로), 파일명에는
+   * '/'를 쓸 수 없어서 buildFileMeta가 따로 만들어둔 meta.fileNameLabel("(n of max)")을
+   * 쓴다 — background.js의 sanitizeFileName이 어차피 '/'를 '-'로 바꿔 저장은 되지만,
+   * "(1-3)"처럼 날짜 구분인지 범위 표시인지 헷갈리는 표기가 되는 것보다 "(1 of 3)"이
+   * 사람이 보기에도, 애초에 치환 없이 바로 유효한 파일명이라는 점에서도 더 낫다.
+   */
+  function buildLocalFileName(meta, rawFileName) {
+    return `[${meta.fileNameLabel}] ${rawFileName}`;
   }
 
   /**
@@ -927,7 +955,7 @@
       const downUrl = await requestDownloadUrl(videoId, entry.file_order, quality.name, entry.file_name);
 
       onStatus('다운로드 시작...', false);
-      const downloadId = await startBrowserDownload(downUrl, entry.file_name, {
+      const downloadId = await startBrowserDownload(downUrl, buildLocalFileName(meta, entry.file_name), {
         videoId,
         fileOrder: Number(entry.file_order),
       });
