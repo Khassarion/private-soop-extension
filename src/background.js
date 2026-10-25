@@ -15,6 +15,25 @@ const LOG_TAG = '[LiveMonitor]';
 const LIVE_CHECK_ALARM_NAME = 'liveCheck';
 const MIN_POLL_INTERVAL_MINUTES = 1;
 const FOCUS_RESTORE_FALLBACK_MS = 10000;
+const LIVE_OPEN_HISTORY_MAX = 200;
+
+/**
+ * 라이브 자동 오픈으로 탭이 실제로 열린 사건 하나를 영구 히스토리에 남긴다
+ * (chrome.storage.local, 최대 200개 — 오래된 것부터 버림). console.log는 서비스 워커
+ * 재시작/브라우저 재시작으로 사라지므로, 나중에 돌아봐도 남아있도록 저장소에 쌍으로 기록한다.
+ * entry: { streamerId, tabId }.
+ */
+async function recordLiveOpenEvent(entry) {
+  const record = { at: Date.now(), ...entry };
+  try {
+    const { liveOpenHistory = [] } = await chrome.storage.local.get(['liveOpenHistory']);
+    liveOpenHistory.push(record);
+    while (liveOpenHistory.length > LIVE_OPEN_HISTORY_MAX) liveOpenHistory.shift();
+    await chrome.storage.local.set({ liveOpenHistory });
+  } catch (error) {
+    console.warn(`${LOG_TAG} 라이브 오픈 히스토리 저장 오류:`, error.message);
+  }
+}
 
 // Soop 페이지가 탭이 실제로 포커스(활성)되기 전에는 스트리밍을 시작하지 않는 것으로 보여,
 // 새 탭을 잠깐 활성화했다가 재생이 시작되면(or 타임아웃 시) 원래 보고 있던 탭으로 되돌린다.
@@ -564,6 +583,7 @@ async function runLiveCheck() {
       setTimeout(() => restoreFocus(tab.id), FOCUS_RESTORE_FALLBACK_MS);
 
       console.log(`${LOG_TAG} ${streamer.id} - 새 탭 생성 (tabId=${tab.id}), 라이브 감지 → 자동 오픈`);
+      recordLiveOpenEvent({ streamerId: streamer.id, tabId: tab.id });
     } catch (error) {
       console.error(`${LOG_TAG} ${streamer.id} - 라이브 체크 오류:`, error);
     }
