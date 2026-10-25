@@ -140,6 +140,24 @@ async function setMonitoredTabs(monitoredTabs) {
   await chrome.storage.session.set({ monitoredTabs });
 }
 
+// monitoredTabs에 대한 모든 읽기-수정-쓰기를 이 체인 하나로 직렬화한다. runLiveCheck(새 탭
+// 등록)와 chrome.tabs.onRemoved(탭 제거)가 각자 독립적으로 get→수정→set을 하다 보니, 한쪽이
+// await로 멈춰있는 동안 다른 쪽이 끼어들어 쓰면 먼저 읽은 쪽의 오래된 스냅샷이 나중에 통째로
+// 덮어써서 방금 지워진 탭이 되살아나는 경쟁 상태가 실제로 있었다("감시 중인 탭 없음에도 있다고
+// 건너뛰는" 버그의 원인). 모든 변경을 updateMonitoredTabs로만 하면 각 변경이 항상 그 직전
+// 변경까지 반영된 최신 상태를 읽고 쓰므로 이 레이스가 생기지 않는다.
+let monitoredTabsQueue = Promise.resolve();
+function updateMonitoredTabs(mutator) {
+  const task = monitoredTabsQueue.then(async () => {
+    const monitoredTabs = await getMonitoredTabs();
+    const result = mutator(monitoredTabs);
+    await setMonitoredTabs(monitoredTabs);
+    return result;
+  });
+  monitoredTabsQueue = task.catch(() => {});
+  return task;
+}
+
 /** 탭의 content script에 메시지를 보내되, 응답이 없거나 실패하면 null (멈춰버리지 않도록 타임아웃) */
 function sendToTab(tabId, message, timeoutMs) {
   return new Promise((resolve) => {
@@ -576,8 +594,9 @@ async function runLiveCheck() {
         url: `https://play.sooplive.com/${encodeURIComponent(streamer.id)}`,
         active: true,
       });
-      monitoredTabs[tab.id] = streamer.id;
-      await setMonitoredTabs(monitoredTabs);
+      await updateMonitoredTabs((current) => {
+        current[tab.id] = streamer.id;
+      });
 
       pendingFocusRestore.set(tab.id, previousActiveTab?.id ?? null);
       setTimeout(() => restoreFocus(tab.id), FOCUS_RESTORE_FALLBACK_MS);
@@ -639,13 +658,13 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 // 감시 중이던 탭이 닫히면 목록에서 제거합니다.
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  const monitoredTabs = await getMonitoredTabs();
-  if (tabId in monitoredTabs) {
-    console.log(`${LOG_TAG} ${monitoredTabs[tabId]} - 감시 탭 종료됨 (tabId=${tabId}), 목록에서 제거`);
-    delete monitoredTabs[tabId];
-    await setMonitoredTabs(monitoredTabs);
-  }
+chrome.tabs.onRemoved.addListener((tabId) => {
+  updateMonitoredTabs((monitoredTabs) => {
+    if (tabId in monitoredTabs) {
+      console.log(`${LOG_TAG} ${monitoredTabs[tabId]} - 감시 탭 종료됨 (tabId=${tabId}), 목록에서 제거`);
+      delete monitoredTabs[tabId];
+    }
+  });
 });
 
 // Studio 업로드 탭이 닫히면 기록을 지워서, 다음 요청 때 새 탭을 하나 연다.
