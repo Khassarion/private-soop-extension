@@ -264,10 +264,11 @@ async function tryFetchVideosFromTab(tabId) {
   return { error: lastError };
 }
 
-// vodUpload:match(vodList.js의 "유튜브 업로드 여부 확인"/"모두 업로드")가 이 함수를 쓴다 — 다른
-// 기능이 동시에 이 함수를 호출할 수도 있으므로, 기존에 열려있는 Studio 탭을 찾아 재사용하지 않고
-// 매번 자기만의 새 탭을 열고 끝나면 닫는다. 탭 재사용은 같은 기능 안에서 순차 처리할 때만 한다
-// (studioTabId/playerTabId 참고) — 서로 다른 버튼이 같은 탭을 가로채 쓰다 꼬이는 사고를 막기 위함.
+// youtubeVideos:fetchAll(playlistSorter.js의 "영상 목록 불러오기")과 vodUpload:match(vodList.js의
+// "유튜브 업로드 여부 확인"/"모두 업로드") 둘 다 이 함수를 쓴다 — 서로 다른 기능이라 동시에 눌릴 수
+// 있으므로, 기존에 열려있는 Studio 탭을 찾아 재사용하지 않고 매번 자기만의 새 탭을 열고 끝나면
+// 닫는다. 탭 재사용은 같은 기능 안에서 순차 처리할 때만 한다(ytAddTabId/studioTabId/playerTabId
+// 참고) — 서로 다른 버튼이 같은 탭을 가로채 쓰다 꼬이는 사고를 막기 위함.
 async function fetchYoutubeVideos() {
   const tab = await chrome.tabs.create({ url: 'https://studio.youtube.com/', active: false });
   try {
@@ -951,7 +952,28 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             vods.push({ videoId, error: 'VOD 정보 조회 실패' });
             continue;
           }
-          vods.push(matchVodFiles(videoId, data.files, index));
+          if (data.files.length === 0) {
+            // 로그인 없이 같은 요청을 직접 보내 확인함: 접근 권한이 없는 VOD(구독자 전용 등)는
+            // files가 빈 배열로 오면서 data.media_exception에 {code, msg}가 같이 온다(실제로
+            // code: -6303 확인됨 — 구독 전용 다시보기로 보이는 응답이었다. 정상적으로 파일이
+            // 있는 VOD에선 이 필드가 안 오거나 비어있을 것으로 추정). files=[]를 그대로
+            // matchVodFiles에 넘기면 빈 배열의 .every(...)가 true라 "전부 업로드됨
+            // (complete:true)"으로 잘못 판정해버리므로 — 권한 부족으로 못 확인한 걸 업로드
+            // 완료로 오판하면 안 되니 — 매칭을 건너뛰고 에러로만 남긴다(펜딩에도, 완료에도 안
+            // 들어가서 배치가 손대지 않음).
+            const exception = data.media_exception;
+            const reason = exception?.code
+              ? `파일 접근 권한 없음 (media_exception code ${exception.code}${exception.msg ? `: ${exception.msg}` : ''}) — 구독자 전용 다시보기일 수 있음`
+              : '파일 정보 없음 (원인 불명)';
+            console.warn(`[VodUpload] 다시보기 ${videoId}의 files가 빈 배열 — ${reason}`, data);
+            vods.push({ videoId, error: reason });
+            continue;
+          }
+          const result = matchVodFiles(videoId, data.files, index);
+          // vodFileInfo.js의 buildFileMeta와 같은 방식 — file_order가 가장 작은(실제 첫 파일)
+          // 것의 file_start를 "방송 시작 시각"으로 쓴다(여러 파일이 있어도 방송은 하나).
+          result.broadcastStart = data.files.reduce((a, b) => (Number(b.file_order) < Number(a.file_order) ? b : a)).file_start || null;
+          vods.push(result);
         }
         sendResponse({ success: true, vods, youtubeVideoCount: youtubeVideos.length });
       } catch (error) {

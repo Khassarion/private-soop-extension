@@ -35,6 +35,64 @@
   }
 
   // ---------------------------------------------------------------------------
+  // 카드에 직접 업로드 여부 배지를 붙인다. 카드 컨테이너 클래스(VodList_itemContainer__GNHCM)는
+  // CSS Modules 해시가 붙어 빌드마다 바뀔 수 있어 접두사만 부분 일치시킨다. 썸네일
+  // 오버레이("다시보기"/재생시간 배지)가 이미 올라가 있는 .thumbnail-image는 해시 없는
+  // 안정적인 클래스라 그 안에 우리 배지를 끼워 넣는다(해시 붙은 오버레이 클래스를 흉내 내지
+  // 않고 우리 자신의 인라인 스타일로 — Soop CSS가 바뀌어도 안 깨지게).
+  // ---------------------------------------------------------------------------
+  const CARD_SELECTOR = '[class*="VodList_itemContainer"]';
+  const THUMBNAIL_SELECTOR = '.thumbnail-image';
+  const BADGE_CLASS = 'private-extension-upload-badge';
+
+  /** videoId -> 카드 엘리먼트. 지금 DOM에 렌더된 카드만 잡는다(무한 스크롤로 나중에 추가되는
+   *  카드는 다시 조회를 돌려야 배지가 붙는다 — 알려진 한계). */
+  function findCardsByVideoId() {
+    const map = new Map();
+    for (const card of document.querySelectorAll(CARD_SELECTOR)) {
+      const a = card.querySelector('a[href*="/player/"]');
+      const m = a?.href.match(/\/player\/(\d+)/);
+      if (m) map.set(m[1], card);
+    }
+    return map;
+  }
+
+  function applyCardBadge(card, text, background) {
+    const thumb = card.querySelector(THUMBNAIL_SELECTOR);
+    if (!thumb) return;
+    if (getComputedStyle(thumb).position === 'static') thumb.style.position = 'relative';
+
+    let badge = thumb.querySelector(`:scope > .${BADGE_CLASS}`);
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = BADGE_CLASS;
+      thumb.appendChild(badge);
+    }
+    badge.textContent = text;
+    badge.style.cssText =
+      `position:absolute;top:4px;right:4px;z-index:5;padding:2px 6px;border-radius:4px;` +
+      `font-size:11px;font-weight:600;color:#fff;background:${background};pointer-events:none;`;
+  }
+
+  /** videoId별로 카드를 찾아 업로드 상태 배지를 붙인다. */
+  function renderCardBadges(vods) {
+    const cards = findCardsByVideoId();
+    for (const vod of vods) {
+      const card = cards.get(String(vod.videoId));
+      if (!card) continue;
+      if (vod.error) applyCardBadge(card, '확인 실패', '#6b7280');
+      else if (vod.complete) applyCardBadge(card, '업로드됨', '#16a34a');
+      else applyCardBadge(card, '미업로드', '#dc2626');
+    }
+  }
+
+  /** 배치가 다시보기 하나를 끝낼 때마다, 재조회 없이 그 카드 배지만 바로 갱신한다. */
+  function markCardUploaded(videoId) {
+    const card = findCardsByVideoId().get(String(videoId));
+    if (card) applyCardBadge(card, '업로드됨', '#16a34a');
+  }
+
+  // ---------------------------------------------------------------------------
   // 배치 큐: 이 페이지(vodList.js) 자신이 "처리할 다시보기 목록"을 들고 순서대로 하나씩
   // background에 vodBatch:start를 보낸다. background는 플레이어 탭을 열어 넘겨줄 뿐,
   // 큐/진행 상태는 전부 여기(탭의 메모리)에 있다 — 그래서 이 탭이 새로고침되면 진행 중이던
@@ -109,6 +167,7 @@
       batchFailed.push({ videoId: request.videoId, reason: `${failOrders.length}개 파일 실패` });
     } else {
       batchDone.push(request.videoId);
+      markCardUploaded(request.videoId);
     }
     renderBatchState();
     advanceBatchQueue();
@@ -200,9 +259,18 @@
     document.body.appendChild(host);
   }
 
+  /** background가 붙여준 vod.broadcastStart(첫 파일의 file_start)를 "YYYY-MM-DD"로. */
+  function formatBroadcastDate(ms) {
+    if (!ms) return '날짜 알 수 없음';
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return '날짜 알 수 없음';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  }
+
   function formatVod(vod) {
     if (vod.error) return `${vod.videoId}  (${vod.error})`;
-    const head = `${vod.videoId}  ${vod.complete ? '업로드 완료' : '미업로드/일부 미업로드'}`;
+    const head = `${vod.videoId}  [${formatBroadcastDate(vod.broadcastStart)}]  ${vod.complete ? '업로드 완료' : '미업로드/일부 미업로드'}`;
     const files = vod.files.map((f) => {
       const label = `  (${f.n}/${vod.fileCount})`;
       if (!f.uploaded) return `${label} ✗ 미업로드`;
@@ -219,7 +287,7 @@
       `유튜브 영상 ${youtubeVideoCount}개 조회 · 다시보기 ${all.length}개 중 미업로드 ${pending.length}개`,
       '',
       '[미업로드 아이디]',
-      pending.map((v) => v.videoId).join('\n') || '(없음)',
+      pending.map((v) => `${v.videoId}  [${formatBroadcastDate(v.broadcastStart)}]`).join('\n') || '(없음)',
       '',
       '[상세]',
       ...all.map(formatVod),
@@ -242,6 +310,7 @@
     });
     // 업로드 자동화가 붙을 지점(다시보기 파이프라인 외의 다른 자동화가 필요해지면 여기서 이어받는다)
     window.dispatchEvent(new CustomEvent('private-extension:vod-match', { detail: { pending, uploaded, all: res.vods } }));
+    renderCardBadges(res.vods);
 
     return { pending, uploaded, all: res.vods, youtubeVideoCount: res.youtubeVideoCount };
   }
