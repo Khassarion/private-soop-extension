@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
       enabled: true,
       youtubeApiKey: '',
       emoticon: '/응원봉2/',
+      emoticonByStreamer: {},
       count: 4,
       minDelay: 1500,
       maxDelay: 2500,
@@ -50,6 +51,11 @@ const el = {
   cheerAutoSendBody: document.getElementById('cheerAutoSendBody'),
   youtubeApiKey: document.getElementById('youtubeApiKey'),
   cheerEmoticon: document.getElementById('cheerEmoticon'),
+  newEmoticonStreamerId: document.getElementById('newEmoticonStreamerId'),
+  newEmoticonValue: document.getElementById('newEmoticonValue'),
+  addEmoticonMappingBtn: document.getElementById('addEmoticonMappingBtn'),
+  emoticonMappingList: document.getElementById('emoticonMappingList'),
+  emoticonMappingEmptyHint: document.getElementById('emoticonMappingEmptyHint'),
   cheerCount: document.getElementById('cheerCount'),
   cheerMinDelay: document.getElementById('cheerMinDelay'),
   cheerMaxDelay: document.getElementById('cheerMaxDelay'),
@@ -114,6 +120,7 @@ function renderAll() {
   el.youtubeApiKey.value = cheer.youtubeApiKey || '';
   el.cheerEmoticon.value = cheer.emoticon;
   el.cheerCount.value = cheer.count;
+  renderEmoticonMappings();
   el.cheerMinDelay.value = cheer.minDelay / 1000;
   el.cheerMaxDelay.value = cheer.maxDelay / 1000;
   updateCardBodyState(el.cheerAutoSendBody, cheer.enabled);
@@ -141,6 +148,55 @@ function renderAll() {
 
   el.balloonWebAppUrl.value = settings.features.balloonSync.webAppUrl;
   el.balloonToken.value = settings.features.balloonSync.token;
+}
+
+function renderEmoticonMappings() {
+  const map = settings.features.cheerAutoSend.emoticonByStreamer || {};
+  const entries = Object.entries(map);
+  el.emoticonMappingList.innerHTML = '';
+  el.emoticonMappingEmptyHint.style.display = entries.length === 0 ? 'block' : 'none';
+
+  for (const [id, emoticon] of entries) {
+    const item = document.createElement('li');
+    item.className = 'streamer-item';
+    item.innerHTML = `
+      <span class="streamer-id"></span>
+      <span class="emoticon-value"></span>
+      <button class="btn-danger">삭제</button>
+    `;
+    item.querySelector('.streamer-id').textContent = id;
+    item.querySelector('.emoticon-value').textContent = emoticon;
+    item.querySelector('button').addEventListener('click', () => {
+      const next = { ...settings.features.cheerAutoSend.emoticonByStreamer };
+      delete next[id];
+      settings.features.cheerAutoSend.emoticonByStreamer = next;
+      persistSettings();
+      renderEmoticonMappings();
+    });
+    el.emoticonMappingList.appendChild(item);
+  }
+}
+
+function handleAddEmoticonMapping() {
+  const id = el.newEmoticonStreamerId.value.trim().toLowerCase();
+  const emoticon = el.newEmoticonValue.value.trim();
+  if (!/^[a-z0-9_]+$/.test(id)) {
+    showToast('스트리머 ID는 영문·숫자·밑줄(_)만 입력할 수 있습니다.', true);
+    return;
+  }
+  if (!/^\/.+\/$/.test(emoticon)) {
+    showToast('이모티콘은 /이모티콘문자열/ 형식으로 입력해주세요.', true);
+    return;
+  }
+
+  settings.features.cheerAutoSend.emoticonByStreamer = {
+    ...settings.features.cheerAutoSend.emoticonByStreamer,
+    [id]: emoticon,
+  };
+  el.newEmoticonStreamerId.value = '';
+  el.newEmoticonValue.value = '';
+  persistSettings();
+  renderEmoticonMappings();
 }
 
 function updateCardBodyState(bodyEl, enabled) {
@@ -244,6 +300,8 @@ function setupEventListeners() {
     settings.features.cheerAutoSend.emoticon = value;
     persistSettings();
   });
+
+  el.addEmoticonMappingBtn.addEventListener('click', handleAddEmoticonMapping);
 
   el.cheerCount.addEventListener('change', (e) => {
     const count = clampInt(e.target.value, 1, 20, settings.features.cheerAutoSend.count);

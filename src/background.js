@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS = {
       enabled: true,
       youtubeApiKey: '',
       emoticon: '/응원봉2/',
+      emoticonByStreamer: {}, // { 스트리머ID(소문자): '/이모티콘/' } — 방송 페이지 주소의 ID와 맞으면 그 이모티콘을 쓴다
       count: 4,
       minDelay: 1500,
       maxDelay: 2500,

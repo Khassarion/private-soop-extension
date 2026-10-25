@@ -245,6 +245,37 @@ async function getCheerAutoSendSettings() {
   return settings?.features?.cheerAutoSend || {};
 }
 
+// play.sooplive.com/{스트리머ID}/{방송번호} 형식의 주소에서 스트리머 ID를 얻는다.
+function currentStreamerId() {
+  const id = location.pathname.split('/').filter(Boolean)[0] || '';
+  return /^[a-z0-9_]+$/i.test(id) ? id.toLowerCase() : null;
+}
+
+// 현재 스트리머에 맵핑된 이모티콘이 있으면 그것을, 없으면 전체 기본 이모티콘을 쓴다.
+function resolveEmoticon(cheerSettings) {
+  const id = currentStreamerId();
+  const mapped = id ? cheerSettings.emoticonByStreamer?.[id] : null;
+  return mapped || cheerSettings.emoticon || DEFAULT_CHEER_OPTIONS.emoticon;
+}
+
+// 현재 스트리머가 맵핑되어 있으면 맵핑 값을, 아니면 전체 기본 이모티콘을 저장한다.
+async function saveEmoticonForCurrentPage(emoticon) {
+  const { settings } = await chrome.storage.local.get(['settings']);
+  const current = settings || { features: {} };
+  current.features = current.features || {};
+  const cheer = current.features.cheerAutoSend || {};
+  const id = currentStreamerId();
+  if (id && cheer.emoticonByStreamer?.[id]) {
+    current.features.cheerAutoSend = {
+      ...cheer,
+      emoticonByStreamer: { ...cheer.emoticonByStreamer, [id]: emoticon },
+    };
+  } else {
+    current.features.cheerAutoSend = { ...cheer, emoticon };
+  }
+  await chrome.storage.local.set({ settings: current });
+}
+
 async function saveCheerAutoSendSettings(partial) {
   const { settings } = await chrome.storage.local.get(['settings']);
   const current = settings || { features: {} };
@@ -451,14 +482,14 @@ function initializeControlPanel() {
 
   getCheerAutoSendSettings().then((cheerSettings) => {
     if (cheerSettings.youtubeApiKey) apiKeyInput.value = cheerSettings.youtubeApiKey;
-    if (cheerSettings.emoticon) panel('#emoticon').value = cheerSettings.emoticon;
+    panel('#emoticon').value = resolveEmoticon(cheerSettings);
     if (cheerSettings.count) panel('#count').value = cheerSettings.count;
     if (cheerSettings.minDelay) panel('#min-delay').value = cheerSettings.minDelay / 1000;
     if (cheerSettings.maxDelay) panel('#max-delay').value = cheerSettings.maxDelay / 1000;
   });
 
   panel('#emoticon').addEventListener('change', (event) => {
-    saveCheerAutoSendSettings({ emoticon: event.target.value.trim() });
+    saveEmoticonForCurrentPage(event.target.value.trim());
   });
 
   panel('#save-key').addEventListener('click', async () => {
@@ -500,8 +531,8 @@ function initializeControlPanel() {
       duration: manualDurationSeconds
     };
     try {
+      await saveEmoticonForCurrentPage(options.emoticon);
       await saveCheerAutoSendSettings({
-        emoticon: options.emoticon,
         count: options.count,
         minDelay: options.minDelay,
         maxDelay: options.maxDelay,

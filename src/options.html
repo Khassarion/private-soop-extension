@@ -42,6 +42,16 @@
             <input type="number" id="cheerMaxDelay" min="1" step="0.1">
           </div>
         </div>
+        <div class="field">
+          <label>스트리머별 이모티콘 (방송 페이지 주소의 스트리머 ID와 맞으면 그 이모티콘을 자동으로 씁니다)</label>
+          <div class="input-group">
+            <input type="text" id="newEmoticonStreamerId" placeholder="스트리머 ID (예: chebi2)">
+            <input type="text" id="newEmoticonValue" placeholder="예: /응원봉2/">
+            <button id="addEmoticonMappingBtn" class="btn-primary">추가</button>
+          </div>
+        </div>
+        <ul class="streamer-list" id="emoticonMappingList"></ul>
+        <p class="empty-hint" id="emoticonMappingEmptyHint">등록된 스트리머별 이모티콘이 없습니다. 위의 기본 이모티콘 문자열을 씁니다.</p>
       </div>
     </section>
 
