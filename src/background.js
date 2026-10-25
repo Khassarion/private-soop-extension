@@ -194,7 +194,7 @@ async function sendWithRetry(tabId, message, attempts = 8, intervalMs = 400) {
  * 같은 페이지에 여러 요청을 계속 흘려보내는 경우 — 매번 새로고침하면 그때마다 처리 중이던
  * 자동화가 끊긴다). 새로 열거나 이동시킨 경우에만 로드 완료를 기다린다.
  */
-async function ensureTabAt(getTabId, setTabId, url, { navigateIfExists = false } = {}) {
+async function ensureTabAt(getTabId, setTabId, url, { navigateIfExists = false, active = true } = {}) {
   let tabId = await getTabId();
   if (tabId != null) {
     try {
@@ -206,14 +206,14 @@ async function ensureTabAt(getTabId, setTabId, url, { navigateIfExists = false }
   }
 
   if (tabId == null) {
-    const tab = await chrome.tabs.create({ url, active: true });
+    const tab = await chrome.tabs.create({ url, active });
     await setTabId(tab.id);
     await waitForTabLoad(tab.id);
     return tab.id;
   }
 
   if (navigateIfExists) {
-    await chrome.tabs.update(tabId, { url, active: true });
+    await chrome.tabs.update(tabId, { url, active });
     await waitForTabLoad(tabId);
   }
   return tabId;
@@ -309,6 +309,26 @@ async function getVodBatchRequest() {
 
 async function setVodBatchRequest(vodBatchRequest) {
   await chrome.storage.session.set({ vodBatchRequest });
+}
+
+// ---------------------------------------------------------------------------
+// 재생목록 날짜순 추가(playlistSorter.js) — 실제 추가는 YouTube Data API(playlistItems.insert,
+// 호출당 50쿼터)가 아니라 www.youtube.com 시청 페이지의 "저장" 버튼을 직접 클릭하는 방식으로
+// 한다. Data API는 쿼터가 하루 ~200건에서 끊기지만, 페이지 조작은 쿼터를 전혀 쓰지 않는다
+// (목록을 읽어오는 조회만 Data API를 그대로 쓴다 — 조회는 호출당 1쿼터라 거의 안 든다).
+// Studio/플레이어 탭과 같은 "탭 하나만 재사용" 정책이지만, 매 요청마다 대상 영상이 바뀌므로
+// 매번 그 영상 페이지로 이동시킨다(navigateIfExists: true). 포커스를 매번 빼앗지 않으려고
+// active: false로 연다.
+// ---------------------------------------------------------------------------
+const YT_ADD_LOG_TAG = '[YtPlaylistAdd]';
+
+async function getYtAddTabId() {
+  const { ytAddTabId } = await chrome.storage.session.get(['ytAddTabId']);
+  return ytAddTabId ?? null;
+}
+
+async function setYtAddTabId(ytAddTabId) {
+  await chrome.storage.session.set({ ytAddTabId });
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +921,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  // playlistSorter.js — 내 업로드 영상 전체(제목·설명)를 Data API 없이 가져온다. vodUpload:match와
+  // 같은 Studio 탭/내부 API를 그대로 재사용한다(fetchYoutubeVideos).
+  if (request.action === 'youtubeVideos:fetchAll') {
+    (async () => {
+      try {
+        const videos = await fetchYoutubeVideos();
+        sendResponse({ success: true, videos });
+      } catch (error) {
+        console.error('[PlaylistSorter] 영상 목록 조회 오류:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
   // 목록 페이지에서 넘어온 VOD 아이디들을, 실제 유튜브 업로드 영상(설명의 Soop 링크 + 제목의 (n/max))과
   // 대조해 파일별 업로드 여부와 유튜브 링크를 돌려준다.
   if (request.action === 'vodUpload:match') {
@@ -985,6 +1020,100 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const tabId = await getPlayerTabId();
       if (tabId != null) sendToTab(tabId, { action: 'vodBatch:cancelCurrent' }, 2000);
       sendResponse({ success: true });
+    })();
+    return true;
+  }
+
+  // playlistSorter.js — 영상 하나를 재생목록에 추가. www.youtube.com 탭을 그 영상 페이지로
+  // 이동시키고 content script(youtubePlaylistAdd.js)에 "저장" 버튼 클릭을 맡긴 뒤 결과를
+  // 그대로 돌려준다. active:true로 연다 — 백그라운드 탭에서는 "저장" 버튼의 재생목록 패널이
+  // 제대로 렌더링되지 않는 걸(재생목록 조회 때의 가상 스크롤과 같은 이유로) 실제로 겪었다.
+  if (request.action === 'ytAdd:add') {
+    (async () => {
+      try {
+        const videoId = String(request.videoId);
+        const tabId = await ensureTabAt(
+          getYtAddTabId,
+          setYtAddTabId,
+          `https://www.youtube.com/watch?v=${videoId}`,
+          { navigateIfExists: true, active: true }
+        );
+        const response = await sendToTab(
+          tabId,
+          { action: 'ytAdd:newRequest', playlistName: request.playlistName },
+          20000
+        );
+        sendResponse(response || { success: false, error: '응답 없음 (탭이 준비되지 않았거나 멈춘 것으로 보임)' });
+      } catch (error) {
+        console.error(`${YT_ADD_LOG_TAG} 처리 오류:`, error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
+  // playlistSorter.js의 "내 재생목록 불러오기" 드롭다운 — Studio의 재생목록 목록 페이지는
+  // "/channel/{channelId}/playlists"로만 접근되는데, channelId를 미리 모르니 두 단계로 간다:
+  // (1) studio.youtube.com/을 열어 Studio 자신의 클라이언트 사이드 리다이렉트가 끝나길
+  // 기다렸다가(로드 완료 이후에도 걸릴 수 있어 재시도 — fetchYoutubeVideos()와 같은 이유)
+  // youtubeVideos.js의 studioChannelId:get으로 channelId를 읽고, (2) 그 탭을 실제 재생목록
+  // 목록 페이지로 이동시켜 youtubePlaylistsList.js에 긁어오게 한다. 한 번 쓰고 버리는
+  // 일회성 탭이고, 업로드 자동화용 studioTabId와는 별개다.
+  if (request.action === 'ytPlaylists:fetchAll') {
+    (async () => {
+      let tabId;
+      try {
+        const tab = await chrome.tabs.create({ url: 'https://studio.youtube.com/', active: false });
+        tabId = tab.id;
+        await waitForTabLoad(tabId);
+
+        let channelId = null;
+        for (let attempt = 0; attempt < 20 && !channelId; attempt += 1) {
+          const res = await sendToTab(tabId, { action: 'studioChannelId:get' }, 2000);
+          if (res?.success) {
+            channelId = res.channelId;
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+        if (!channelId) throw new Error('채널 정보를 찾지 못했습니다.');
+
+        await chrome.tabs.update(tabId, { url: `https://studio.youtube.com/channel/${channelId}/content/playlists` });
+        await waitForTabLoad(tabId);
+        const response = await sendToTab(tabId, { action: 'ytPlaylists:fetchAll' }, 60000);
+        sendResponse(response || { success: false, error: '응답 없음' });
+      } catch (error) {
+        console.error(`${YT_ADD_LOG_TAG} 재생목록 목록 조회 오류:`, error);
+        sendResponse({ success: false, error: error.message });
+      } finally {
+        if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+      }
+    })();
+    return true;
+  }
+
+  // playlistSorter.js — Studio의 재생목록 "동영상" 탭(페이지네이션)에서 전체 videoId를
+  // 가져온다. 공개 재생목록 페이지는 전세계 차단된 영상을 안 보여줘서 멤버십 판정에
+  // 못 쓴다는 게 실제로 확인됨 — 이쪽이 신뢰할 수 있는 진짜 기준이다.
+  // studioTabId(업로드 자동화용)는 건드리지 않는다 — 항상 새 탭을 열고 끝나면 닫는 일회성이라,
+  // 업로드가 진행 중인 Studio 탭을 엉뚱하게 다른 페이지로 이동시킬 일이 없다.
+  if (request.action === 'ytPlaylistVideos:fetchAll') {
+    (async () => {
+      let tabId;
+      try {
+        const listId = String(request.listId);
+        const tab = await chrome.tabs.create({ url: `https://studio.youtube.com/playlist/${listId}/videos`, active: false });
+        tabId = tab.id;
+        await waitForTabLoad(tabId);
+        // 페이지를 끝까지 넘기는 작업이라 영상이 많으면 오래 걸릴 수 있어 넉넉히 준다.
+        const response = await sendToTab(tabId, { action: 'ytPlaylistVideos:fetchAll' }, 120000);
+        sendResponse(response || { success: false, error: '응답 없음' });
+      } catch (error) {
+        console.error(`${YT_ADD_LOG_TAG} 재생목록 영상 목록(Studio) 조회 오류:`, error);
+        sendResponse({ success: false, error: error.message });
+      } finally {
+        if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});
+      }
     })();
     return true;
   }

@@ -8,6 +8,25 @@
 const VOD_LINK_RE = /sooplive\.com\/player\/(\d+)/;
 const TITLE_PART_RE = /^\s*\[[^\]]*?\((\d+)\/(\d+)\)\]/;
 const TITLE_SINGLE_RE = /^\s*\[[^\]()]+\]/;
+const TITLE_DATE_RE = /^\s*\[(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일(?:\s*\((\d+)\/(\d+)\))?\]/;
+const BROADCAST_START_RE = /방송\s*시간:\s*(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/;
+
+/** 제목 앞머리 "[YYYY년 M월 D일 (n/max)]"의 정렬 키 { date: YYYYMMDD 숫자, n }. 날짜가 없으면 null. */
+export function parseTitleDate(title) {
+  const m = TITLE_DATE_RE.exec(title || '');
+  if (!m) return null;
+  const date = Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]);
+  const n = m[4] ? Number(m[4]) : 1;
+  return { date, n };
+}
+
+/** 설명의 "방송 시간: YYYY-MM-DD HH:mm:ss ~ …" 시작 시각(ms epoch). vodFileInfo.js의 buildFileMeta가 쓰는 형식과 맞춘다. 없으면 null. */
+export function parseBroadcastStart(description) {
+  const m = BROADCAST_START_RE.exec(description || '');
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(s)).getTime();
+}
 
 /** 영상 하나에서 { vodId(soop), n, max }를 뽑는다. 못 뽑으면 null. */
 export function parseUpload(video) {

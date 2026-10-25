@@ -13,12 +13,26 @@
   const FALLBACK_CLIENT_VERSION = '1.20250101.00.00';
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    if (request?.action !== 'youtubeVideos:list') return false;
-    listAllVideos().then(
-      (videos) => sendResponse({ success: true, videos }),
-      (error) => sendResponse({ success: false, error: error.message })
-    );
-    return true;
+    if (request?.action === 'youtubeVideos:list') {
+      listAllVideos().then(
+        (videos) => sendResponse({ success: true, videos }),
+        (error) => sendResponse({ success: false, error: error.message })
+      );
+      return true;
+    }
+
+    // playlistSorter.js의 재생목록 목록 조회(youtubePlaylistsList.js)가 쓴다 — Studio는
+    // "/channel/{id}/playlists"로 가야 재생목록이 보이는데 처음엔 그 id를 모르니, 일단
+    // studio.youtube.com/을 열어 Studio 자신의 클라이언트 사이드 리다이렉트가 끝난 뒤(이 content
+    // script가 이미 해결해둔 listAllVideos()의 channelId 추출과 같은 값) 읽어서 돌려준다.
+    // 리다이렉트가 로드 완료 이후에 끝날 수 있어, 못 찾으면 실패로 응답하고 호출 쪽이 재시도한다.
+    if (request?.action === 'studioChannelId:get') {
+      const channelId = location.pathname.match(/\/channel\/(UC[\w-]+)/)?.[1] || null;
+      sendResponse({ success: !!channelId, channelId });
+      return false;
+    }
+
+    return false;
   });
 
   function pageConfig(name) {
