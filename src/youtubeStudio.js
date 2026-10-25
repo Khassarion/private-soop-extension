@@ -44,6 +44,7 @@
   const INTERVAL_MS = 1000; // MainLoop, 삭제 담당 Loop 공통 주기
   const MAX_STAGNANT_RETRIES = 5; // 같은 요청을 재시작해도 더 나아가지 못한 횟수가 이걸 넘으면 수동 대기
   const RETRY_DELAY_MS = 1500; // 같은 요청을 재시작하기 전 짧은 대기(Studio UI 연타 방지)
+  const DAILY_LIMIT_RETRY_DELAY_MS = 60 * 60 * 1000; // 일일 업로드 한도 도달 시 재시도 대기(1시간)
   const FOLDER_WAIT_POLL_MS = 1000; // 폴더 권한 대기 중 재확인 주기
 
   const STEP_WAIT_MS = 5000;
@@ -316,6 +317,21 @@
         return;
       }
 
+      // 일일 업로드 한도는 우리 자동화가 막힌 게 아니라 Studio 쪽 한도라서, 몇 번을 겪어도
+      // "정체" 횟수(stagnantRetries)에 전혀 영향을 주면 안 된다 — 늘리지 않을 뿐 아니라, 이
+      // 한도를 만나기 전까지 쌓여 있던 정체 횟수도 여기서 리셋한다(그 전 실패들과 이 한도는
+      // 무관하므로, 1시간 뒤 재시도부터는 진짜 자동화 실패만 공정하게 다시 센다). 도달한
+      // 단계(bestStep)는 그래도 기록해둔다. 1시간 뒤 업로드 창을 처음부터(1단계) 다시 열고,
+      // 저장까지 끝난 경우는 8단계부터 이어간다.
+      if (isDailyUploadLimitReached()) {
+        const reachedStep = result.failedAtStep - 1;
+        if (reachedStep > bestStep) bestStep = reachedStep;
+        stagnantRetries = 0;
+        await waitForDailyUploadLimitReset(tag, seq);
+        fileSelected = false;
+        continue;
+      }
+
       fileSelected = fileSelected || result.fileSelected;
       saved = saved || result.saved;
       const reachedStep = result.failedAtStep - 1;
@@ -346,6 +362,24 @@
       }
       await sleep(RETRY_DELAY_MS);
     }
+  }
+
+  /** Studio 업로드 창에 "일일 업로드 한도 도달" 안내가 떠 있는지(보이는 요소만 본다). */
+  function isDailyUploadLimitReached() {
+    return Array.from(document.querySelectorAll('.error-short')).some(
+      (el) => isVisible(el) && normalize(el.textContent).includes('일일 업로드 한도')
+    );
+  }
+
+  async function waitForDailyUploadLimitReset(tag, seq) {
+    const resumeAt = Date.now() + DAILY_LIMIT_RETRY_DELAY_MS;
+    console.warn(`${tag} 일일 업로드 한도 도달 — 1시간 뒤 재시도`);
+    while (Date.now() < resumeAt) {
+      const remainingMin = Math.ceil((resumeAt - Date.now()) / 60000);
+      setStatusText(`[요청 #${seq}] 일일 업로드 한도 도달 — 1시간 뒤 재시도 (약 ${remainingMin}분 남음)`, true);
+      await sleep(Math.min(60000, Math.max(resumeAt - Date.now(), 0)));
+    }
+    console.log(`${tag} 일일 업로드 한도 대기 종료 — 재개`);
   }
 
   function enterManualWaitMode() {
