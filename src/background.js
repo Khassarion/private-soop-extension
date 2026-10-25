@@ -250,29 +250,32 @@ async function deliverStudioRequest(payload) {
   await sendWithRetry(tabId, { action: 'studio:newRequest', payload });
 }
 
-/** 유튜브 Studio 탭을 통해 내 채널의 업로드 영상 목록을 가져온다. 열린 Studio 탭이 없으면 잠깐 열었다 닫는다. */
-async function fetchYoutubeVideos() {
-  const existing = await chrome.tabs.query({ url: 'https://studio.youtube.com/*' });
-  let tabId = existing.find((t) => /\/channel\/UC/.test(t.url || ''))?.id ?? existing[0]?.id;
-  let createdTabId = null;
-  if (tabId == null) {
-    const tab = await chrome.tabs.create({ url: 'https://studio.youtube.com/', active: false });
-    tabId = createdTabId = tab.id;
+/** tabId에 youtubeVideos:list를 보내보고, 새로 연 탭은 content script/채널 페이지 리다이렉트가
+ *  준비될 때까지 몇 번 다시 시도한다. 반환값: { videos } 또는 { error }. */
+async function tryFetchVideosFromTab(tabId) {
+  let lastError = '응답 없음';
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const res = await sendToTab(tabId, { action: 'youtubeVideos:list' }, 60000);
+    if (res?.success) return { videos: res.videos };
+    lastError = res?.error || '응답 없음';
+    if (res && !String(res.error).startsWith('NO_CHANNEL')) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
+  return { error: lastError };
+}
 
+// vodUpload:match(vodList.js의 "유튜브 업로드 여부 확인"/"모두 업로드")가 이 함수를 쓴다 — 다른
+// 기능이 동시에 이 함수를 호출할 수도 있으므로, 기존에 열려있는 Studio 탭을 찾아 재사용하지 않고
+// 매번 자기만의 새 탭을 열고 끝나면 닫는다. 탭 재사용은 같은 기능 안에서 순차 처리할 때만 한다
+// (studioTabId/playerTabId 참고) — 서로 다른 버튼이 같은 탭을 가로채 쓰다 꼬이는 사고를 막기 위함.
+async function fetchYoutubeVideos() {
+  const tab = await chrome.tabs.create({ url: 'https://studio.youtube.com/', active: false });
   try {
-    // 새로 연 탭은 content script/채널 페이지 리다이렉트가 준비될 때까지 몇 번 다시 시도한다.
-    let lastError = '응답 없음';
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const res = await sendToTab(tabId, { action: 'youtubeVideos:list' }, 60000);
-      if (res?.success) return res.videos;
-      lastError = res?.error || '응답 없음';
-      if (res && !String(res.error).startsWith('NO_CHANNEL')) break;
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-    throw new Error(`유튜브 영상 목록을 가져오지 못했습니다: ${lastError}`);
+    const result = await tryFetchVideosFromTab(tab.id);
+    if (result.videos) return result.videos;
+    throw new Error(`유튜브 영상 목록을 가져오지 못했습니다: ${result.error}`);
   } finally {
-    if (createdTabId != null) chrome.tabs.remove(createdTabId).catch(() => {});
+    chrome.tabs.remove(tab.id).catch(() => {});
   }
 }
 
