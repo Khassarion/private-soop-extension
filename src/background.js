@@ -1153,11 +1153,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // playlistSorter.js — Studio의 재생목록 "동영상" 탭(페이지네이션)에서 전체 videoId를
-  // 가져온다. 공개 재생목록 페이지는 전세계 차단된 영상을 안 보여줘서 멤버십 판정에
-  // 못 쓴다는 게 실제로 확인됨 — 이쪽이 신뢰할 수 있는 진짜 기준이다.
-  // studioTabId(업로드 자동화용)는 건드리지 않는다 — 항상 새 탭을 열고 끝나면 닫는 일회성이라,
-  // 업로드가 진행 중인 Studio 탭을 엉뚱하게 다른 페이지로 이동시킬 일이 없다.
+  // playlistSorter.js — 재생목록의 videoId 전체를 실제 배치 순서대로 가져온다. 한때 공개
+  // 재생목록 페이지(순서)와 Studio API(완전성)를 따로 받아 병합하는 하이브리드로 바꿔봤지만
+  // 둘 다 실제로는 못 믿을 데이터였다: Studio API(`creator/list_creator_playlist_videos`)
+  // 응답은 재생목록 순서가 아니라 videoId 알파벳순이었고(1624개 중 1593개가 알파벳순으로
+  // 확인됨), 차단된 영상의 실제 위치를 알아내려고 썼던 watch+list 페이지의 "다음 영상" 패널
+  // currentIndex도 버그가 있었다(실제로 새 재생목록 만들어 검증 — 나중에 추가한 차단 영상이
+  // "1/28"로 떠서 전혀 못 믿을 값으로 확인됨). 그래서 DOM을 직접 긁는 원래 방식으로 되돌렸다
+  // (Studio "동영상" 탭을 사람이 50개씩 넘기며 보는 것과 동일 — 이게 유일하게 실제로 맞다고
+  // 확인된 방법). studioTabId(업로드 자동화용)는 건드리지 않는다 — 항상 새 탭을 열고 끝나면
+  // 닫는 일회성이라, 업로드가 진행 중인 Studio 탭을 엉뚱하게 다른 페이지로 이동시킬 일이 없다.
   if (request.action === 'ytPlaylistVideos:fetchAll') {
     (async () => {
       let tabId;
@@ -1165,12 +1170,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const listId = String(request.listId);
         const tab = await chrome.tabs.create({ url: `https://studio.youtube.com/playlist/${listId}/videos`, active: false });
         tabId = tab.id;
-        await waitForTabLoad(tabId);
-        // 페이지를 끝까지 넘기는 작업이라 영상이 많으면 오래 걸릴 수 있어 넉넉히 준다.
-        const response = await sendToTab(tabId, { action: 'ytPlaylistVideos:fetchAll' }, 120000);
-        sendResponse(response || { success: false, error: '응답 없음' });
+        // 기본 20초보다 여유를 둔다 — 로딩이 다 끝나기 전에 타임아웃으로 넘어가 탭을 닫고
+        // 실패 처리해버리는 경우가 실제로 있었다.
+        await waitForTabLoad(tabId, 25000);
+        // 영상이 1000~2000개인 재생목록을 50개씩 다 넘기는 데 고정 타임아웃으로는 턱없이
+        // 부족할 수 있어, 시간 제한 없이 content script가 끝낼 때까지 기다린다(sendToTab의
+        // 타이머 기반 타임아웃을 안 쓰고 chrome.tabs.sendMessage를 직접 기다림) — content
+        // script 쪽엔 이미 MAX_PAGES 안전장치가 있어 영원히 응답이 안 오는 일은 없다. 탭이
+        // 닫히거나 죽으면 sendMessage 자체가 reject돼 catch로 떨어진다.
+        const result = await chrome.tabs.sendMessage(tabId, { action: 'ytPlaylistVideos:fetchAll' });
+        sendResponse(result);
       } catch (error) {
-        console.error(`${YT_ADD_LOG_TAG} 재생목록 영상 목록(Studio) 조회 오류:`, error);
+        console.error(`${YT_ADD_LOG_TAG} 재생목록 영상 목록 조회 오류:`, error);
         sendResponse({ success: false, error: error.message });
       } finally {
         if (tabId != null) chrome.tabs.remove(tabId).catch(() => {});

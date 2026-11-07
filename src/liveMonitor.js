@@ -7,7 +7,6 @@
   const LOG_TAG = '[LiveMonitor]';
   const STALL_CHECK_INTERVAL_MS = 3000;
   const STALL_THRESHOLD_MS = 12000;
-  const MAX_RELOAD_ATTEMPTS = 3;
   const RELOAD_COUNT_KEY = 'pextLiveMonitorReloadCount';
   const DEFAULT_AUTO_CLOSE_DELAY_SECONDS = 5;
 
@@ -151,16 +150,12 @@
   }
 
   function attemptReload(streamerId) {
-    const count = Number(sessionStorage.getItem(RELOAD_COUNT_KEY) || '0');
-    if (count >= MAX_RELOAD_ATTEMPTS) {
-      // 라이브 API는 계속 방송 중이라고 하는데 재생이 반복적으로 끊기는 경우.
-      // 원인을 알 수 없으므로 더 이상 자동 조치하지 않고 감시만 멈춘다.
-      console.log(`${LOG_TAG} ${streamerId} - 재로딩 상한(${MAX_RELOAD_ATTEMPTS}회) 도달, 감시 중단`);
-      stopWatching();
-      return;
-    }
-    sessionStorage.setItem(RELOAD_COUNT_KEY, String(count + 1));
-    console.log(`${LOG_TAG} ${streamerId} - 페이지 새로고침 시도 (${count + 1}/${MAX_RELOAD_ATTEMPTS})`);
+    // 라이브 API가 계속 방송 중이라고 확인해주는 한, 재로딩 자체는 비용이 거의 없으니 횟수를
+    // 제한하지 않는다(예전엔 3회로 끊었는데, 끊긴 뒤엔 감시만 멈추고 탭은 그대로 방치돼서
+    // 멈춘 영상이 영원히 남는 더 나쁜 상태였다). 횟수는 로그 확인용으로만 센다.
+    const count = Number(sessionStorage.getItem(RELOAD_COUNT_KEY) || '0') + 1;
+    sessionStorage.setItem(RELOAD_COUNT_KEY, String(count));
+    console.log(`${LOG_TAG} ${streamerId} - 페이지 새로고침 시도 (${count}번째)`);
     location.reload();
   }
 

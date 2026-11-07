@@ -149,6 +149,10 @@
       // a#video-title이 없는 특이한 행일 때 videoId를 못 읽어 영원히 "안 넘어감"으로 오판하고
       // 멈추는 버그가 있었다(실제 재현됨) — 페이지 전체의 id 집합을 비교해 그런 행 하나 때문에
       // 전체가 막히지 않게 한다.
+      // 영상이 1000~2000개인 재생목록에서 다음 페이지 로딩이 느려져 10초 제한으로 끊기는
+      // 문제를 실제로 겪어서(그래서 한동안 Studio 내부 API 직접 호출로 바꿨었는데, 그 API가
+      // 재생목록 실제 순서를 안 주는 걸로 확인되어 다시 이 DOM 방식으로 되돌렸다) 여기는
+      // 제한시간을 두지 않는다 — 느려도 결국 넘어가는 게 중간에 포기하는 것보다 낫다.
       const idsBefore = pageIds.join(',');
       nextBtn.click();
       const changed = await waitForStable(() => {
@@ -156,7 +160,7 @@
         if (!rows) return null;
         const idsNow = rows.map(rowVideoId).filter(Boolean).join(',');
         return idsNow && idsNow !== idsBefore ? rows : null;
-      }, 10000);
+      }, Infinity);
       if (!changed) {
         const stuckIds = (findRows() || []).map(rowVideoId);
         console.warn(
